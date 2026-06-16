@@ -50,6 +50,34 @@ So the blocker is not unified-memory bandwidth and not the choice of framework �
 it's a **gap in the entire Apple-GPU numerical stack**. The steps that are easy to
 move to Metal aren't worth moving; the steps worth moving can't be moved.
 
+## Background: why RAPIDS doesn't just run on an Apple GPU
+
+[rapids-singlecell](https://github.com/scverse/rapids-singlecell) gets its speed from
+NVIDIA's **RAPIDS** stack — CuPy (GPU arrays), cuML (GPU machine learning), cuGraph
+(GPU graph algorithms), plus thousands of lines of hand-written **CUDA** kernels.
+CUDA is NVIDIA-only. Apple GPUs are programmed with **Metal** (and Apple's
+higher-level frameworks like MPS and MLX), a completely different API and driver
+stack. There is no CUDA-on-Metal translation layer, and RAPIDS has no Metal backend
+— so "running it on an Apple GPU" is not a port, it's a from-scratch reimplementation
+on a different GPU framework.
+
+The realistic Apple-GPU options for array/ML work today are:
+
+- **PyTorch's MPS backend** — mature, broad operator coverage, the path used in this
+  benchmark.
+- **MLX** — Apple's own array framework, built around unified memory.
+
+Both can do elementwise math, reductions, and matrix multiply on the GPU. **Neither
+can do the matrix factorizations (SVD / eigendecomposition / QR) that PCA, spectral
+embeddings, and many ML algorithms depend on** — those run on the CPU only. That gap,
+not raw GPU throughput, is what this benchmark runs into.
+
+One more Apple-specific wrinkle worth knowing: **unified memory.** On a discrete
+NVIDIA card the GPU has its own high-bandwidth VRAM, so moving memory-bound work to
+the GPU is a clear win. Apple Silicon shares one memory pool (and one bandwidth
+budget) between CPU and GPU, so for bandwidth-limited work the GPU has no inherent
+advantage — the win, when there is one, comes from parallelism, not faster memory.
+
 ## Why this matters beyond single-cell
 
 Any GPU-accelerated scientific Python workload that leans on SVD / eigendecomposition
