@@ -15,6 +15,8 @@ standalone, reproducible benchmark and probes behind that conclusion.
 
 ## TL;DR
 
+![Speedup by step: memory-bound elementwise steps win on the GPU, compute-bound PCA/KNN do not](results.png)
+
 | Step | Bound by | CPU (scanpy/sklearn) | Apple GPU (PyTorch-MPS) | |
 |---|---|--:|--:|--|
 | normalize_total + log1p | memory | 161 ms | **15 ms (10.7×)** | GPU wins |
@@ -81,6 +83,7 @@ anywhere with no download.
 | [`bench.py`](bench.py) | The benchmark: 4 pipeline steps, each timed on CPU vs Apple GPU, with warm-up, MPS synchronization, transfer-cost accounting, correctness checks, and a watchdog so a hung kernel can't lock the run. Heavily commented. |
 | [`probe_mps_linalg.py`](probe_mps_linalg.py) | Shows which PyTorch-MPS linalg routines work, fall back to CPU, or hang. |
 | [`probe_mlx_linalg.py`](probe_mlx_linalg.py) | Shows that MLX's `svd`/`qr`/`eigh` are GPU-unsupported. |
+| [`make_chart.py`](make_chart.py) | Regenerates `results.png` (the chart above) from the measured numbers. |
 | [`RESULTS.md`](RESULTS.md) | Full results, interpretation, and methodology notes. |
 | `*.log` | Raw captured output from the runs on an M5 Pro. |
 
