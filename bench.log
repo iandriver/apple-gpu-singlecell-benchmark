@@ -1,0 +1,57 @@
+Device: mps | torch 2.12.0
+Matrix: 50,000 cells x 20,000 genes @ 7% density
+
+========================================================================
+Building data
+========================================================================
+  sparse counts: nnz=67,607,940  (6.8% dense)  built in 4.0s
+
+========================================================================
+STEP 1  normalize_total + log1p   [memory-bound, sparse .data only]
+========================================================================
+
+  normalize_total + log1p
+    CPU (scanpy/sklearn)      :     161.0 ms
+    MPS compute-only          :      15.1 ms   (10.65x vs CPU)
+    MPS incl. host->device    :      29.1 ms   ( 5.53x vs CPU)
+    max|CPU - GPU| (correctness): 4.768e-07
+
+========================================================================
+Preparing HVG-subset dense block for steps 2-4
+========================================================================
+  dense block: 50,000 x 2,000  (400 MB float32)
+
+========================================================================
+STEP 2  scale (z-score per gene + clip)   [memory-bound, dense]
+========================================================================
+
+  scale
+    CPU (scanpy/sklearn)      :     156.6 ms
+    MPS compute-only          :      27.5 ms   ( 5.70x vs CPU)
+    MPS incl. host->device    :      34.1 ms   ( 4.60x vs CPU)
+    max|CPU - GPU| (correctness): 7.248e-05
+
+========================================================================
+STEP 3  PCA   [COMPUTE-bound; GPU path = Gram matmul on GPU + eig on CPU]
+========================================================================
+
+  PCA (n_comps=50, hybrid)
+    CPU (scanpy/sklearn)      :     320.5 ms
+    MPS compute-only          :     230.2 ms   ( 1.39x vs CPU)
+    MPS incl. host->device    :     240.2 ms   ( 1.33x vs CPU)
+
+========================================================================
+STEP 4  exact brute-force KNN   [COMPUTE-bound]
+========================================================================
+
+  KNN (k=15, exact)
+    CPU (scanpy/sklearn)      :     581.2 ms
+    MPS compute-only          :    6867.0 ms   ( 0.08x vs CPU)
+    MPS incl. host->device    :    2277.2 ms   ( 0.26x vs CPU)
+
+========================================================================
+Done
+========================================================================
+  Read the per-step speedups against the memory-bound vs compute-bound
+  labels. That contrast is the whole feasibility story.
+

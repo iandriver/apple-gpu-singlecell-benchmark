@@ -1,0 +1,8 @@
+torch 2.12.0 | device mps
+pca_lowrank q=50         TIMEOUT >30s (hang)
+linalg.qr (tall)         TIMEOUT >30s (hang)
+/Users/iandriver/Downloads/apple-gpu-singlecell-benchmark/probe_mps_linalg.py:74: UserWarning: The operator 'aten::linalg_svd' is not currently supported on the MPS backend and will fall back to run on the CPU. This may have performance implications. (Triggered internally at /Users/runner/work/pytorch/pytorch/aten/src/ATen/mps/MPSFallback.mm:34.)
+  trial("linalg.svd full", lambda: torch.linalg.svd(Xc, full_matrices=False))
+linalg.svd full          OK   13352.8 ms
+randomized-svd matmul    TIMEOUT >30s (hang)
+gram + eigh 2000         ERROR NotImplementedError("The operator 'aten::_linalg_eigh.eigenvalues' is not currently implem

@@ -1,0 +1,8 @@
+# Core benchmark dependencies (Apple Silicon + macOS).
+# mlx is installed separately and only needed for probe_mlx_linalg.py.
+torch>=2.12
+scanpy>=1.12
+scikit-learn
+scipy
+numpy
+anndata

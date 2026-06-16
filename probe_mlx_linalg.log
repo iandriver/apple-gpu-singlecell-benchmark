@@ -1,0 +1,5 @@
+mlx 0.31.2 | default device Device(gpu, 0)
+svd (50k x 2k)             ERROR ValueError('[linalg::svd] This op is not yet supported on the GPU. Explicitly pass a CPU s
+qr (50k x 2k)              ERROR ValueError('[linalg::qr] This op is not yet supported on the GPU. Explicitly pass a CPU st
+eigh (2k x 2k Gram)        ERROR ValueError('[linalg::eigh] This op is not yet supported on the GPU. Explicitly pass a CPU 
+full GPU PCA (gram+eigh)   ERROR ValueError('[linalg::eigh] This op is not yet supported on the GPU. Explicitly pass a CPU 
