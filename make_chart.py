@@ -15,11 +15,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Measured on Apple M5 Pro (see RESULTS.md / bench.log)
-steps = ["normalize\n+ log1p", "scale", "PCA\n(50 comps)", "exact KNN\n(k=15)"]
-kind = ["memory-bound", "memory-bound", "compute-bound", "compute-bound"]
-compute_only = [10.7, 5.7, 1.4, 0.08]   # CPU / MPS, data resident on GPU
-with_transfer = [5.5, 4.6, 1.3, 0.26]    # CPU / MPS, incl. host->device copy
+# Measured on Apple M5 Pro (see RESULTS.md / bench.log / pca_gpu_rsvd.log)
+steps = ["normalize\n+ log1p", "scale", "PCA\nnaive hybrid", "PCA\nCholeskyQR\n(no new kernel)", "exact KNN\n(k=15)"]
+compute_only = [10.7, 5.7, 1.4, 7.5, 0.08]   # CPU / MPS, data resident on GPU
+with_transfer = [5.5, 4.6, 1.3, 6.6, 0.26]    # CPU / MPS, incl. host->device copy
 
 x = np.arange(len(steps))
 w = 0.38
@@ -40,11 +39,11 @@ ax.set_ylim(0.05, 22)
 
 # shaded regions behind the two camps (drawn first, sit underneath the bars)
 ax.axvspan(-0.5, 1.5, color="#2a9d54", alpha=0.05, zorder=0)
-ax.axvspan(1.5, 3.5, color="#c0392b", alpha=0.05, zorder=0)
+ax.axvspan(1.5, 4.5, color="#b8860b", alpha=0.05, zorder=0)
 ax.text(0.5, 17, "memory-bound\n(GPU wins, but cheap)", ha="center", va="top",
         fontsize=9, color="#2a9d54")
-ax.text(2.5, 17, "compute-bound\n(needs GPU linalg — unavailable)", ha="center", va="top",
-        fontsize=9, color="#c0392b")
+ax.text(3.0, 17, "compute-bound\n(algorithm choice decides the win)", ha="center", va="top",
+        fontsize=9, color="#9c6b08")
 
 b1 = ax.bar(x - w / 2, compute_only, w, color=colors(compute_only),
             label="GPU compute-only", edgecolor="white", linewidth=0.6, zorder=3)

@@ -64,18 +64,39 @@ ValueError: [linalg::qr]   ... not yet supported on the GPU ...
 ValueError: [linalg::eigh] ... not yet supported on the GPU ...
 ```
 
-So **neither PyTorch-MPS nor MLX can do an eigendecomposition / SVD / QR on the Apple GPU today.**
-This is not a framework-choice problem — it is a gap in the entire Apple-GPU numerical stack. The
-PCA bottleneck cannot be moved onto the GPU with off-the-shelf tools, full stop.
+So **neither PyTorch-MPS nor MLX exposes an `eigh` / `svd` / `qr` on the Apple GPU today.** This is
+not a framework-choice problem — it is a gap in the Apple-GPU numerical stack.
 
-The only ways to get GPU SVD/eig on Apple Silicon are to **hand-write Metal kernels** (e.g. a Jacobi
-eigensolver) or build against Apple's lower-level Metal decomposition APIs — a serious,
-specialized effort for each routine. Accelerate/LAPACK on Mac is CPU-only.
+For a *general* GPU SVD/eig you would **hand-write Metal kernels** (e.g. a Jacobi eigensolver) or
+build against Apple's lower-level Metal decomposition APIs — a bounded but specialized effort per
+routine. Accelerate/LAPACK on Mac is CPU-only. **But for the low-rank PCA case the gap is routable
+today without any kernel — see the Update.**
 
-### Bottom line
-A useful Apple-GPU rapids-singlecell is **not feasible with today's frameworks**. The cheap
-elementwise steps accelerate but don't matter; the steps that matter (PCA, neighbors, UMAP,
-clustering) need GPU linear algebra and graph primitives that simply do not exist on Metal yet —
-in either PyTorch or MLX. Revisit when Apple-GPU SVD/eigh lands (track the MLX and PyTorch-MPS
-issue trackers), or scope the project to "scanpy on CPU + GPU only for the few matmul-heavy spots,"
-which buys little.
+## Update — PCA *is* GPU-accelerable (correcting the bottom line)
+
+The "PCA is a wash" result above used a *naive* algorithm (Gram matrix on GPU, eig on CPU), and the
+CPU eig dominated. A better algorithm changes the verdict.
+
+MPS lacks `eigh`/`svd`/`qr`, but it **does** ship `cholesky` (~5 ms, 2000×2000), `solve_triangular`,
+and fast `matmul`. Those build a GPU QR via **Cholesky-QR** (`Q = Y · chol(YᵀY)⁻¹`), which builds a
+**randomized SVD almost entirely on the GPU**; the only off-GPU step is a ~60×60 eig on the CPU
+(microseconds). See [`pca_gpu_rsvd.py`](pca_gpu_rsvd.py).
+
+| PCA route | CPU | Apple GPU | speedup |
+|---|--:|--:|--:|
+| naive (Gram + CPU eig) | 321 ms | 230 ms | 1.4× |
+| **CholeskyQR randomized SVD** | 365 ms | **49 ms** | **7.5×** (6.6× incl. transfer) |
+
+Leading singular values match sklearn to ~3e-4. Stability: Cholesky-QR squares the condition number,
+so we run it twice (**CholeskyQR2**). Accuracy on the weakest of the 50 components is looser (~15%),
+tightened with more oversampling / power iterations.
+
+### Bottom line (revised)
+- **PCA / truncated low-rank SVD: feasible on the Apple GPU today** (~1 day, no custom kernel, ~7.5×).
+  The earlier "compute-bound is blocked" claim was too broad — algorithm choice, not the GPU, was
+  the limiter.
+- **Memory-bound elementwise steps** accelerate (5–10×) but are cheap in absolute terms.
+- **Exact KNN, approximate neighbors, and graph clustering** (cuGraph-equivalents) remain genuinely
+  missing on Metal; these are the real blockers to a full Apple-GPU rapids-singlecell.
+- A **general drop-in GPU `svd`/`eigh`** still needs a Metal Jacobi kernel (bounded, multi-week),
+  pluggable via `torch.mps.compile_shader()`. Revisit when the frameworks ship GPU linalg.

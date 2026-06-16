@@ -4,9 +4,11 @@
 Silicon GPU (Metal), the way [rapids-singlecell](https://github.com/scverse/rapids-singlecell)
 does on NVIDIA GPUs with RAPIDS/CUDA?**
 
-Short answer, measured on an **Apple M5 Pro**: **not usefully, today** — and the
-reason is more interesting than "Macs are slow." This repo contains the
-standalone, reproducible benchmark and probes behind that conclusion.
+Short answer, measured on an **Apple M5 Pro**: **mostly not, today** — for a
+reason more interesting than "Macs are slow" — **but with one important exception
+that emerged from this work: PCA, done with the right algorithm, runs ~7.5× faster
+on the GPU with no custom Metal kernel** (see [Update](#update-pca-is-gpu-accelerable-after-all)).
+This repo contains the standalone, reproducible benchmark and probes behind it.
 
 > Origin: this started as a feasibility study for porting rapids-singlecell to
 > Apple GPUs. It is **not** affiliated with that project and is not intended as a
@@ -15,14 +17,17 @@ standalone, reproducible benchmark and probes behind that conclusion.
 
 ## TL;DR
 
-![Speedup by step: memory-bound elementwise steps win on the GPU, compute-bound PCA/KNN do not](results.png)
+![Speedup by step: memory-bound elementwise steps win; naive PCA is a wash but CholeskyQR PCA wins; KNN loses](results.png)
 
 | Step | Bound by | CPU (scanpy/sklearn) | Apple GPU (PyTorch-MPS) | |
 |---|---|--:|--:|--|
 | normalize_total + log1p | memory | 161 ms | **15 ms (10.7×)** | GPU wins |
 | scale (z-score + clip) | memory | 157 ms | **28 ms (5.7×)** | GPU wins |
-| PCA (50 comps) | compute | 321 ms | 230 ms (1.4×) | ~wash |
+| PCA — naive (Gram + CPU eig) | compute | 321 ms | 230 ms (1.4×) | ~wash |
+| **PCA — CholeskyQR rSVD** | compute | 365 ms | **49 ms (7.5×)** | **GPU wins** ⭐ |
 | exact KNN (k=15) | compute | 581 ms | 6867 ms (0.08×) | **GPU loses** |
+
+⭐ The CholeskyQR row is the [Update](#update-pca-is-gpu-accelerable-after-all) finding — same data, a smarter algorithm, no new kernel.
 
 *(MPS = kernel time with data resident on the GPU; transfer-inclusive numbers and
 methodology are in [RESULTS.md](RESULTS.md).)*
@@ -34,10 +39,9 @@ and the heavy linear-algebra steps would. The opposite happened:
 - The **cheap elementwise steps won big** — but mostly because scanpy's CPU path
   is effectively single-threaded, and the absolute savings (~150 ms → ~30 ms) are
   trivial in a real pipeline.
-- The **expensive steps that actually dominate runtime — PCA, neighbors, UMAP,
-  clustering — are exactly what the Apple GPU can't do**, because there is **no GPU
-  eigendecomposition / SVD / QR on Apple Silicon today**, in *either* major
-  framework:
+- The **expensive steps that dominate runtime — PCA, neighbors, UMAP, clustering**
+  — hit a wall: there is **no GPU eigendecomposition / SVD / QR on Apple Silicon
+  today**, in *either* major framework:
 
   | routine | PyTorch-MPS 2.12 | MLX 0.31 |
   |---|---|---|
@@ -47,8 +51,39 @@ and the heavy linear-algebra steps would. The opposite happened:
   | `pca_lowrank` | **hangs** | n/a |
 
 So the blocker is not unified-memory bandwidth and not the choice of framework —
-it's a **gap in the entire Apple-GPU numerical stack**. The steps that are easy to
-move to Metal aren't worth moving; the steps worth moving can't be moved.
+it's a **gap in the Apple-GPU numerical stack**. But that gap turns out to be
+*routable* for some workloads — see the Update below.
+
+## Update: PCA is GPU-accelerable after all
+
+The original conclusion ("PCA is a wash on Apple GPU") was true for the *naive*
+algorithm and **wrong for the right one** — exactly the kind of thing a benchmark
+should surface.
+
+Although MPS has no `eigh`/`svd`/`qr`, it **does** have `cholesky` (~5 ms for
+2000×2000), `solve_triangular`, and fast `matmul`. Those three are enough to build
+a QR factorization on the GPU via **Cholesky-QR** (`Q = Y · chol(YᵀY)⁻¹`), which is
+enough to build a **randomized SVD almost entirely on the GPU**. The only off-GPU
+step is a trivial `(k+p)×(k+p)` (~60×60) eigendecomposition on the CPU — microseconds.
+
+Result on the M5 Pro (50k×2000, 50 components): **7.5× vs sklearn randomized PCA**
+(6.6× including host→device), leading singular values matching to **~3e-4**, **no
+custom Metal kernel required**. See [`pca_gpu_rsvd.py`](pca_gpu_rsvd.py).
+
+What this changes — and what it doesn't:
+
+- **PCA / truncated low-rank SVD / spectral embedding: feasible today**, ~1 day of
+  work, no kernel writing. The earlier "compute-bound = blocked" claim was too broad.
+- **A general drop-in `torch.linalg.svd`/`eigh` on the GPU** (all singular values,
+  ill-conditioned inputs) is still a real but **bounded** project — a Metal one-sided
+  Jacobi SVD / two-sided Jacobi eigh, slotted in via `torch.mps.compile_shader()`.
+- **Exact KNN still loses on the GPU** here; approximate neighbors and graph
+  clustering (cuGraph-equivalents) remain genuinely missing on Metal.
+
+Caveats: Cholesky-QR squares the condition number, so we run it twice
+(**CholeskyQR2**) for stability — still cheap, still on the GPU. Randomized SVD's
+accuracy on the *weakest* of the 50 components is looser (~15%); the leading ones
+are essentially exact, and more oversampling / power iterations tighten the tail.
 
 ## Background: why RAPIDS doesn't just run on an Apple GPU
 
@@ -68,9 +103,11 @@ The realistic Apple-GPU options for array/ML work today are:
 - **MLX** — Apple's own array framework, built around unified memory.
 
 Both can do elementwise math, reductions, and matrix multiply on the GPU. **Neither
-can do the matrix factorizations (SVD / eigendecomposition / QR) that PCA, spectral
-embeddings, and many ML algorithms depend on** — those run on the CPU only. That gap,
-not raw GPU throughput, is what this benchmark runs into.
+exposes the matrix factorizations (`svd` / `eigh` / `qr`) that PCA, spectral
+embeddings, and many ML algorithms reach for** — those run on the CPU only. That gap,
+not raw GPU throughput, is what this benchmark runs into. (PyTorch-MPS does ship
+`cholesky` + `solve_triangular`, which is enough to *route around* the gap for
+low-rank PCA — see the [Update](#update-pca-is-gpu-accelerable-after-all).)
 
 One more Apple-specific wrinkle worth knowing: **unified memory.** On a discrete
 NVIDIA card the GPU has its own high-bandwidth VRAM, so moving memory-bound work to
@@ -82,9 +119,11 @@ advantage — the win, when there is one, comes from parallelism, not faster mem
 
 Any GPU-accelerated scientific Python workload that leans on SVD / eigendecomposition
 / QR (PCA, spectral methods, least-squares, many ML algorithms) hits the same wall
-on Apple Silicon right now. Apple's `Accelerate`/LAPACK is CPU-only; getting these
-onto the GPU currently means hand-writing Metal kernels (e.g. a Jacobi eigensolver)
-or waiting for the frameworks to ship GPU linalg.
+on Apple Silicon right now. Apple's `Accelerate`/LAPACK is CPU-only. Two ways out:
+for **low-rank** problems, route around the gap with `cholesky`-based methods
+(the CholeskyQR randomized SVD in the [Update](#update-pca-is-gpu-accelerable-after-all)
+is a worked example); for the **general** case, hand-write a Metal Jacobi
+eigensolver — or wait for the frameworks to ship GPU linalg.
 
 ## Run it yourself
 
@@ -97,6 +136,7 @@ uv pip install --python ./.venv/bin/python -r requirements.txt
 uv pip install --python ./.venv/bin/python mlx   # for the MLX probe only
 
 ./.venv/bin/python bench.py              # the 4-step pipeline benchmark
+./.venv/bin/python pca_gpu_rsvd.py       # GPU CholeskyQR randomized-SVD PCA (~7.5x)
 ./.venv/bin/python probe_mps_linalg.py   # which PyTorch-MPS linalg ops work
 ./.venv/bin/python probe_mlx_linalg.py   # which MLX linalg ops run on GPU
 ```
@@ -109,6 +149,7 @@ anywhere with no download.
 | File | What |
 |---|---|
 | [`bench.py`](bench.py) | The benchmark: 4 pipeline steps, each timed on CPU vs Apple GPU, with warm-up, MPS synchronization, transfer-cost accounting, correctness checks, and a watchdog so a hung kernel can't lock the run. Heavily commented. |
+| [`pca_gpu_rsvd.py`](pca_gpu_rsvd.py) | The Update finding: GPU randomized-SVD PCA via CholeskyQR (~7.5×, no custom kernel), validated against sklearn. |
 | [`probe_mps_linalg.py`](probe_mps_linalg.py) | Shows which PyTorch-MPS linalg routines work, fall back to CPU, or hang. |
 | [`probe_mlx_linalg.py`](probe_mlx_linalg.py) | Shows that MLX's `svd`/`qr`/`eigh` are GPU-unsupported. |
 | [`make_chart.py`](make_chart.py) | Regenerates `results.png` (the chart above) from the measured numbers. |
