@@ -41,8 +41,8 @@ the original LAPACK, unchanged):
 
 | ops | on MPS |
 |---|---|
-| `eigh`, `eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank` | **GPU-accelerated** for batched-small (via the Metal kernels); CPU round-trip otherwise |
-| `qr`, `lstsq`, `eig`, `eigvals`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU win — makes the call succeed) |
+| `eigh`, `eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank`, `qr` | **GPU-accelerated** for batched-small (via the Metal kernels); CPU round-trip otherwise |
+| `lstsq`, `eig`, `eigvals`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU win — makes the call succeed) |
 
 The round-trip moves inputs to CPU, runs LAPACK, and moves the result **back to the
 input device/dtype**, preserving the structseq return type (`.eigenvalues`, unpacking,
@@ -62,7 +62,8 @@ some — notably `qr` — *hang* on MPS instead of raising.
 | **6** | **parallel-ordering Jacobi rewrite (round-robin)** | ✅ **built, tested — slower for batched; not default** |
 | **5** | **drop-in `torch.linalg.{eigh,svd}` patch + pip packaging** | ✅ **done** |
 | **7** | **complete `torch.linalg`-on-MPS shim (full factorization surface)** | ✅ **done** |
-| **8** | **accelerate more ops: pinv (6.2×), matrix_rank (1.7×); qr/lstsq stay CPU** | ✅ **done** |
+| **8** | **accelerate more ops: pinv (6.2×), matrix_rank (1.7×)** | ✅ **done** |
+| **9** | **Metal Householder QR kernel — `qr` now GPU (2.4–3.3×)** | ✅ **done — GPU wins** |
 
 ## What Phase 0 delivered
 
@@ -253,11 +254,34 @@ full SVD for them (slow). `qr`/`lstsq` lose because their CPU paths use cheap QR
 we're working around. So those two stay on the CPU round-trip. (`gpu_qr`/`gpu_lstsq`
 remain in `accel.py` as correct, available implementations.)
 
+## What Phase 9 delivered — a custom Metal QR that beats CPU
+
+The Phase-8 rule ("qr can't win") was overturned by writing a *dedicated kernel*
+instead of leaning on torch's MPS primitives. `batched_householder_qr` is a
+threadgroup-resident Householder QR (one threadgroup/matrix, single direct pass —
+no convergence iteration, so few barriers). Measured ([`test_phase9.py`](test_phase9.py)),
+correctness ~1e-7 (R exactly upper):
+
+| shape | batch | HH-GPU | CPU | speedup | vs old CholeskyQR |
+|---|--:|--:|--:|--:|--:|
+| 48×16 | 16,384 | 16.9 ms | 44.7 ms | **2.7×** | 31× |
+| 64×32 | 16,384 | 40.7 ms | 133.7 ms | **3.3×** | 32× |
+
+The ~30× gap over CholeskyQR confirms that path's loss was entirely torch's slow
+native MPS `cholesky` — not the math. **Refined rule:** a custom Metal kernel (own
+threadgroup, no torch MPS linalg) *can* beat CPU even for cheap factorizations like
+QR; what loses is leaning on torch's native batched MPS linalg over tiny matrices.
+
+`lstsq` was *also* tried via this fast QR but still lost (~0.24×): the QR is fast,
+but the triangular solve `R x = Qᵀb` goes back through torch's slow MPS
+`solve_triangular`. Winning `lstsq` would need the solve fused into the kernel
+(future work); for now it stays a CPU round-trip.
+
 ## Files
 
 | File | What |
 |---|---|
-| [`kernels.metal`](kernels.metal) | Metal source. P0: `saxpy`, `apply_col_rotation`. P1: `jacobi_eigh`. P2: `batched_jacobi_eigh`(+`_vg` for large n). P3: `batched_jacobi_svd`. |
+| [`kernels.metal`](kernels.metal) | Metal source. P1: `jacobi_eigh`. P2: `batched_jacobi_eigh`(+`_vg`). P3: `batched_jacobi_svd`. P9: `batched_householder_qr`. |
 | [`_dispatch.py`](_dispatch.py) | `compile_shader` singleton + MPS-tensor dispatch helpers. |
 | [`kernels.py`](kernels.py) | Python wrappers + `metal_eigh`/`metal_svd` entry points. |
 | [`reference.py`](reference.py) | Accuracy metrics + pathological test matrices. |
@@ -272,8 +296,9 @@ remain in `accel.py` as correct, available implementations.)
 | [`test_phase4.py`](test_phase4.py) | Phase 4: fp16 measurement, dispatch routing, fallback guard. |
 | [`test_phase6.py`](test_phase6.py) | Phase 6: parallel-ordering correctness + speed (the negative result). |
 | [`patch.py`](patch.py) | The `torch.linalg`-on-MPS shim: full factorization surface (install/uninstall/patched). |
-| [`accel.py`](accel.py) | GPU pinv/matrix_rank (win) + qr/lstsq (correct, kept; CPU is faster). |
-| [`test_phase8.py`](test_phase8.py) | Phase 8: acceleration of pinv/matrix_rank/qr/lstsq + the speed rule. |
+| [`accel.py`](accel.py) | GPU pinv/matrix_rank + householder_qr (all wins); gpu_qr/gpu_lstsq kept as reference. |
+| [`test_phase8.py`](test_phase8.py) | Phase 8: acceleration of pinv/matrix_rank + the speed rule. |
+| [`test_phase9.py`](test_phase9.py) | Phase 9: Metal Householder QR — correctness + the GPU-wins benchmark. |
 | [`test_phase5.py`](test_phase5.py) | Phase 5: drop-in patch + packaging test. |
 | [`test_phase7.py`](test_phase7.py) | Phase 7: full torch.linalg-on-MPS surface (12 checks). |
 

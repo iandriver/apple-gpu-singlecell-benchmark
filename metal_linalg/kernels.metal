@@ -577,3 +577,103 @@ kernel void batched_jacobi_eigh_par(
 
     for (uint e = tid; e < nn; e += PAR_BTG) { Ab[e] = sA[e]; Vb[e] = sV[e]; }
 }
+
+// ─── Phase 9 (QR experiment): batched Householder QR ────────────────────────
+//
+// One threadgroup per matrix, matrix resident in threadgroup memory, single
+// direct pass (no convergence iteration). Reduced QR of tall A (m x n, m>=n):
+//   A : [B,m,n] in (read-only)        Q : [B,m,n] out (orthonormal cols)
+//                                      R : [B,n,n] out (upper triangular)
+// For each column j: build the Householder reflector from the subcolumn (one
+// threadgroup reduction for its norm), then apply it to the trailing columns
+// (one thread per trailing column). Q is formed by applying the reflectors in
+// reverse to the first n columns of the identity. Householder is backward-stable
+// (unlike CholeskyQR), so accuracy is good in fp32.
+#ifndef QR_MAXM
+#define QR_MAXM 64
+#endif
+#ifndef QR_MAXN
+#define QR_MAXN 32
+#endif
+#ifndef QR_BTG
+#define QR_BTG 64
+#endif
+
+kernel void batched_householder_qr(
+    device const float* A [[buffer(0)]],
+    device float*       Q [[buffer(1)]],
+    device float*       R [[buffer(2)]],
+    constant uint&      m [[buffer(3)]],
+    constant uint&      n [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint b   [[threadgroup_position_in_grid]])
+{
+    threadgroup float sA[QR_MAXM * QR_MAXN];
+    threadgroup float sQ[QR_MAXM * QR_MAXN];
+    threadgroup float tau[QR_MAXN];
+    threadgroup float tg[QR_BTG];
+
+    device const float* Ab = A + b * m * n;
+    for (uint e = tid; e < m * n; e += QR_BTG) sA[e] = Ab[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- factorization: R in upper(sA), Householder vectors below diag ----
+    for (uint j = 0; j < n; ++j) {
+        float local = 0.0f;                                   // ||A[j+1:, j]||²
+        for (uint i = j + 1 + tid; i < m; i += QR_BTG) { float a = sA[i * n + j]; local += a * a; }
+        tg[tid] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = QR_BTG / 2; s > 0; s >>= 1) {
+            if (tid < s) tg[tid] += tg[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float xnorm2 = tg[0];
+        const float x0 = sA[j * n + j];
+        float beta, tj;
+        if (xnorm2 <= 1e-30f) { beta = x0; tj = 0.0f; }
+        else {
+            const float nrm = sqrt(x0 * x0 + xnorm2);
+            beta = (x0 >= 0.0f) ? -nrm : nrm;                 // -sign(x0)·||x||
+            tj = (beta - x0) / beta;
+        }
+        if (tj != 0.0f) {                                     // v[i] = A[i,j]/(x0-beta)
+            const float denom = x0 - beta;
+            for (uint i = j + 1 + tid; i < m; i += QR_BTG) sA[i * n + j] /= denom;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { tau[j] = tj; sA[j * n + j] = beta; }  // R[j,j] = beta
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tj != 0.0f && tid < n && tid > j) {               // one thread / trailing col
+            const uint c = tid;
+            float w = sA[j * n + c];                          // v[j]=1
+            for (uint i = j + 1; i < m; ++i) w += sA[i * n + j] * sA[i * n + c];
+            sA[j * n + c] -= tj * w;
+            for (uint i = j + 1; i < m; ++i) sA[i * n + c] -= tj * w * sA[i * n + j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* Rb = R + b * n * n;
+    for (uint e = tid; e < n * n; e += QR_BTG) {
+        const uint i = e / n, k = e % n;
+        Rb[e] = (k >= i) ? sA[i * n + k] : 0.0f;
+    }
+
+    // ---- form Q = H_0 H_1 ... H_{n-1} applied to I[:, :n] (reverse order) ----
+    for (uint e = tid; e < m * n; e += QR_BTG) { const uint i = e / n, c = e % n; sQ[e] = (i == c) ? 1.0f : 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int j = int(n) - 1; j >= 0; --j) {
+        const float tj = tau[j];
+        if (tj != 0.0f && tid < n) {
+            const uint c = tid, uj = uint(j);
+            float w = sQ[uj * n + c];
+            for (uint i = uj + 1; i < m; ++i) w += sA[i * n + uj] * sQ[i * n + c];
+            sQ[uj * n + c] -= tj * w;
+            for (uint i = uj + 1; i < m; ++i) sQ[i * n + c] -= tj * w * sA[i * n + uj];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* Qb = Q + b * m * n;
+    for (uint e = tid; e < m * n; e += QR_BTG) Qb[e] = sQ[e];
+}

@@ -26,18 +26,19 @@ import contextlib
 
 import torch
 
-from .accel import gpu_matrix_rank, gpu_pinv
+from .accel import (QR_M_MAX, QR_N_MAX, gpu_matrix_rank, gpu_pinv,
+                    householder_qr)
 from .dispatch import eigh as _fast_eigh
 from .kernels import (BATCH_N_MAX, SVD_M_MAX, SVD_N_MAX, batched_eigh,
                       batched_svd)
 
 _orig = {}   # name -> original torch.linalg callable
 
-# torch.linalg functions with no GPU win here -> CPU round-trip on MPS. We accelerate
-# an op only when its CPU baseline is SVD-bound (pinv, matrix_rank); ops whose CPU path
-# is cheap QR (qr itself, lstsq) are FASTER on CPU, so they round-trip. (Measured in
-# test_phase8: GPU CholeskyQR ~0.08x, GPU-SVD lstsq ~0.73x — both losers.)
-_FALLBACK_OPS = ["qr", "lstsq", "eig", "eigvals", "slogdet", "matrix_power", "cond"]
+# torch.linalg functions with no GPU win here -> CPU round-trip on MPS.
+# lstsq is here: the GPU QR is fast, but the triangular solve (R x = Qᵀb) goes through
+# torch's native MPS solve_triangular, which is slow over many tiny matrices (~0.24x
+# overall). Winning would require fusing the solve into the QR kernel (future work).
+_FALLBACK_OPS = ["lstsq", "eig", "eigvals", "slogdet", "matrix_power", "cond"]
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -132,6 +133,22 @@ def _svdvals(A, *, driver=None):
     return _orig["svdvals"](A, driver=driver)
 
 
+def _qr_in_range(A):
+    return (A.ndim == 3 and A.shape[-2] >= A.shape[-1]
+            and A.shape[-2] <= QR_M_MAX and A.shape[-1] <= QR_N_MAX)
+
+
+def _qr(A, mode="reduced"):
+    if _is_mps(A):
+        if mode == "reduced" and _qr_in_range(A):
+            try:
+                return _ret("linalg_qr", householder_qr(A))      # GPU Householder
+            except Exception:
+                pass
+        return _roundtrip(_orig["qr"], (A,), {"mode": mode})
+    return _orig["qr"](A, mode=mode)
+
+
 def _pinv(A, *args, **kwargs):
     # accelerate only the plain pinv(A) batched-small call; anything fancier -> CPU
     if _is_mps(A) and not args and not kwargs and _svd_in_range(A, full_matrices=False):
@@ -160,7 +177,7 @@ def _make_fallback(name):
 
 # ── install / uninstall ───────────────────────────────────────────────────--
 _ACCEL = {"eigh": _eigh, "eigvalsh": _eigvalsh, "svd": _svd, "svdvals": _svdvals,
-          "pinv": _pinv, "matrix_rank": _matrix_rank}
+          "pinv": _pinv, "matrix_rank": _matrix_rank, "qr": _qr}
 
 
 def install():

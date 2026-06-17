@@ -13,7 +13,29 @@ from __future__ import annotations
 
 import torch
 
+from ._dispatch import get_lib_variant
 from .kernels import batched_svd
+
+QR_M_MAX = 64      # matches QR_MAXM in kernels.metal
+QR_N_MAX = 32      # matches QR_MAXN
+
+
+def householder_qr(A: torch.Tensor, btg: int = 64):
+    """Batched reduced QR via the Metal Householder kernel (one threadgroup/matrix).
+
+    A: (B,m,n) tall, m>=n, m<=64, n<=32. Returns (Q (B,m,n), R (B,n,n)) on MPS.
+    Backward-stable Householder (unlike CholeskyQR); single direct pass.
+    """
+    assert A.ndim == 3 and A.shape[-2] >= A.shape[-1]
+    B, m, n = A.shape
+    assert m <= QR_M_MAX and n <= QR_N_MAX
+    lib = get_lib_variant({"QR_MAXM": QR_M_MAX, "QR_MAXN": QR_N_MAX, "QR_BTG": btg})
+    Aw = A.to(device="mps", dtype=torch.float32).contiguous()
+    Q = torch.empty(B, m, n, device="mps", dtype=torch.float32)
+    R = torch.empty(B, n, n, device="mps", dtype=torch.float32)
+    lib.batched_householder_qr(Aw, Q, R, int(m), int(n),
+                               threads=(btg * B,), group_size=(btg,))
+    return Q, R
 
 
 def _batched(A):
