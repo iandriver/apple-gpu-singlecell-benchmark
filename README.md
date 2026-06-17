@@ -182,12 +182,18 @@ trackers. `bench.py` re-measures it in one command.
 Rather than wait for the frameworks, [`metal_linalg/`](metal_linalg/) is a
 follow-up subproject building a general-purpose GPU `eigh`/`svd` for Apple Silicon
 with custom Metal **Jacobi** kernels (dispatched via `torch.mps.compile_shader`).
-**Phases 0–2 done:** the `compile_shader` path is proven; a GPU two-sided Jacobi
-`eigh` matches LAPACK to ~1e-6 across pathological matrices; and the **batched**
-eigh (one threadgroup per matrix, threadgroup-resident) is an **actual ~4× speedup
-over CPU/Accelerate** for many small matrices — a real, measured GPU win where the
-frameworks offer nothing. See its [README](metal_linalg/README.md) for the roadmap
-and numbers.
+**Phases 0–3 done.** The `compile_shader` path is proven; a GPU two-sided Jacobi
+`eigh` matches LAPACK to ~1e-6; and **batched** `eigh` and `svd` (one threadgroup
+per matrix) deliver **real, measured speedups over CPU/Accelerate** for many small
+matrices — where the frameworks offer nothing:
+
+| op | best speedup (M5 Pro) |
+|---|---|
+| batched `eigh` | **7.5×** (n=16); >1× through n=64 |
+| batched `svd` | **6.4×** (48×16) |
+
+See its [README](metal_linalg/README.md) for the full size-vs-speedup tables and
+the honest boundaries (the win peaks at small n and fades past n≈64).
 
 ## License
 

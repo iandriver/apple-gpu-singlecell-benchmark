@@ -20,10 +20,11 @@ on Metal SVD, [NextLA.jl](https://arxiv.org/html/2508.06339v1), produced singula
 |---|---|---|
 | **0** | **Integration scaffold + accuracy/benchmark harness** | ✅ **done** |
 | **1** | **eigh — two-sided Jacobi, single threadgroup (the go/no-go)** | ✅ **done — GO** |
-| **2** | **batched eigh — one threadgroup/matrix, threadgroup-resident: actual GPU win** | ✅ **done — ~4× vs CPU** |
-| 3 | svd — one-sided Jacobi (+ QR precondition for tall) | planned |
+| **2** | **batched eigh — one threadgroup/matrix, threadgroup-resident: actual GPU win** | ✅ **done — up to 7.5×** |
+| **2b** | **batched eigh for larger n (32<n≤64), V in device memory** | ✅ **done — 3.1× @48, 1.3× @64** |
+| **3** | **batched svd — one-sided Jacobi (tall/wide), with vectors** | ✅ **done — up to 6.4×** |
 | 4 | robustness & precision (fp16, scaling, CPU fallback) | planned |
-| 5 | integration: patch `torch.linalg.{svd,eigh}` on MPS, batching, packaging | planned |
+| 5 | integration: patch `torch.linalg.{svd,eigh}` on MPS, packaging | planned |
 
 ## What Phase 0 delivered
 
@@ -92,25 +93,54 @@ matrices stay resident per core. Tuning lifted n=16 from 6.2× to **7.5×** and
 n=32 from ~3.9× to ~4.9×. The measured optima (e.g. fewer threads/matrix:
 btg=32) are the baked-in defaults.
 
-Caveats (honest): (1) ~4× is the *steady-state throughput ratio* — both sides scale
-linearly with batch once saturated, so it's not unbounded; (2) timings are
-**data-resident-on-GPU** (the realistic case when eigh is one step in a GPU
-pipeline), matching the "compute-only" column in the parent benchmark; (3) the
-batched path is for `n ≤ 32` (threadgroup-memory-resident) — the small-matrix
-regime, which is exactly where batching applies.
+Caveats (honest): (1) the speedup is the *steady-state throughput ratio* — both
+sides scale linearly with batch once saturated, so it's not unbounded; (2) timings
+are **data-resident-on-GPU** (the realistic case when eigh is one step in a GPU
+pipeline), matching the "compute-only" column in the parent benchmark.
+
+### eigh speedup vs n (batch ≥ 4096)
+
+| n | 8 | 16 | 32 | 48 | 64 |
+|---|--:|--:|--:|--:|--:|
+| GPU speedup vs CPU | 3.7× | **7.5×** | 4.9× | 3.1× | 1.3× |
+
+n ≤ 32 is fully threadgroup-resident; 32 < n ≤ 64 keeps A on-chip and V in device
+memory (`batched_jacobi_eigh_vg`). The win **peaks around n=16** and narrows past
+n=32 — by n=64 it's marginal (V-in-global traffic, lower occupancy, and Jacobi's
+growing flop disadvantage). The batched sweet spot is small matrices, which is
+exactly where batching is the right tool.
+
+## What Phase 3 delivered — batched SVD
+
+`batched_jacobi_svd`: one-sided (Hestenes) Jacobi, one threadgroup per matrix,
+columns orthogonalized in threadgroup memory. Gives U, S, **and V** with good
+small-singular-value accuracy (unlike a Gram/AᵀA shortcut). Tall handled directly;
+wide via transpose. Correctness vs LAPACK ~1e-6 (recon, U/V orthonormality, values).
+
+Speed ([`test_phase3.py`](test_phase3.py)) vs CPU/Accelerate batched `torch.linalg.svd`:
+
+| shape | batch | GPU ms | CPU ms | speedup |
+|---|--:|--:|--:|--:|
+| 48×16 | 4,096 | 15.6 | 96.0 | **6.1×** |
+| 48×16 | 16,384 | 60.3 | 382.7 | **6.4×** |
+| 64×32 | 4,096 | 69.5 | 263.8 | **3.8×** |
+| 64×32 | 16,384 | 275.6 | 1055.5 | **3.8×** |
 
 ## Files
 
 | File | What |
 |---|---|
-| [`kernels.metal`](kernels.metal) | Metal source. P0: `saxpy`, `apply_col_rotation`. P1: `jacobi_eigh`. P2: `batched_jacobi_eigh`. |
+| [`kernels.metal`](kernels.metal) | Metal source. P0: `saxpy`, `apply_col_rotation`. P1: `jacobi_eigh`. P2: `batched_jacobi_eigh`(+`_vg` for large n). P3: `batched_jacobi_svd`. |
 | [`_dispatch.py`](_dispatch.py) | `compile_shader` singleton + MPS-tensor dispatch helpers. |
 | [`kernels.py`](kernels.py) | Python wrappers + `metal_eigh`/`metal_svd` entry points. |
 | [`reference.py`](reference.py) | Accuracy metrics + pathological test matrices. |
 | [`bench.py`](bench.py) | CPU-baseline benchmark harness. |
 | [`test_phase0.py`](test_phase0.py) | Phase 0 acceptance test (13 checks). |
 | [`test_phase1.py`](test_phase1.py) | Phase 1 acceptance test: GPU Jacobi eigh vs LAPACK (14 checks). |
-| [`test_phase2.py`](test_phase2.py) | Phase 2: batched eigh correctness + GPU-vs-CPU speed (real ~4× win). |
+| [`test_phase2.py`](test_phase2.py) | Phase 2: batched eigh correctness + GPU-vs-CPU speed. |
+| [`test_phase2b.py`](test_phase2b.py) | Phase 2b: batched eigh at n=48/64 (V-in-global). |
+| [`test_phase3.py`](test_phase3.py) | Phase 3: batched SVD correctness (tall/wide) + speed. |
+| [`tune_batched.py`](tune_batched.py) | Occupancy autotune sweep for batched eigh. |
 
 ## Run
 
@@ -118,8 +148,10 @@ regime, which is exactly where batching applies.
 # from the repo root, using the project venv
 python -m metal_linalg.test_phase0    # integration scaffold  -> 13 passed
 python -m metal_linalg.test_phase1    # GPU Jacobi eigh vs LAPACK -> 14 passed
-python -m metal_linalg.test_phase2    # batched eigh: correctness + ~4x GPU speedup
-python -m metal_linalg.bench          # CPU baselines
+python -m metal_linalg.test_phase2    # batched eigh: correctness + speed (up to 7.5x)
+python -m metal_linalg.test_phase2b   # batched eigh at n=48/64
+python -m metal_linalg.test_phase3    # batched SVD: correctness + speed (up to 6.4x)
+python -m metal_linalg.tune_batched   # occupancy autotune
 ```
 
 ## Scope notes

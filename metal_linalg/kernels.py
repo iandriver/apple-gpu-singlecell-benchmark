@@ -83,15 +83,15 @@ def metal_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
 
 
 # ── batched eigh (Phase 2: the actual GPU-speedup path) ────────────────────
-BATCH_N_MAX = 32       # largest n the threadgroup-resident path supports
+BATCH_N_MAX = 64       # largest n the batched path supports (32< n <=64 via V-global)
 
 
 def _bucket(n: int) -> int:
-    """Smallest supported threadgroup footprint (BATCH_MAX_BN) that holds n."""
+    """Smallest threadgroup footprint that holds n (fully-resident path, n<=32)."""
     for b in (8, 16, 32):
         if n <= b:
             return b
-    raise AssertionError(f"batched path supports n <= {BATCH_N_MAX} (got {n})")
+    raise AssertionError(f"fully-resident path needs n <= 32 (got {n})")
 
 
 def _default_btg(n: int) -> int:
@@ -107,26 +107,81 @@ def batched_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
                  max_bn: int | None = None, btg: int | None = None):
     """Batched symmetric eigh for many small matrices, one GPU threadgroup each.
 
-    A : (B, n, n) with n <= BATCH_N_MAX.  Returns (w (B,n) ascending, V (B,n,n)).
-    max_bn / btg override the autotuned threadgroup footprint / threads-per-matrix.
-    This is the throughput regime where the GPU beats the CPU.
+    A : (B, n, n), n <= 64.  Returns (w (B,n) ascending, V (B,n,n)).
+    n <= 32 uses the fully threadgroup-resident kernel (A and V on-chip); 32 < n <= 64
+    keeps A on-chip and V in device memory. max_bn / btg override the autotuned config.
     """
     assert A.ndim == 3 and A.shape[1] == A.shape[2], "(B, n, n) expected"
     B, n, _ = A.shape
-    max_bn = max_bn or _bucket(n)
-    btg = btg or _default_btg(n)
+    assert n <= BATCH_N_MAX, f"batched path supports n <= {BATCH_N_MAX} (got {n})"
     out_dev = A.device if A.device.type == "mps" else "cpu"
 
-    lib = get_lib_variant({"BATCH_MAX_BN": max_bn, "BATCH_BTG": btg})
     Aw = A.to(device="mps", dtype=torch.float32).contiguous().clone()
     V = torch.empty_like(Aw)
-    lib.batched_jacobi_eigh(Aw, V, int(n), int(max_sweeps), float(tol),
-                            threads=(btg * B,), group_size=(btg,))
+
+    if n <= 32:
+        max_bn = max_bn or _bucket(n)
+        btg = btg or _default_btg(n)
+        lib = get_lib_variant({"BATCH_MAX_BN": max_bn, "BATCH_BTG": btg})
+        lib.batched_jacobi_eigh(Aw, V, int(n), int(max_sweeps), float(tol),
+                                threads=(btg * B,), group_size=(btg,))
+    else:
+        big_n = max_bn or (48 if n <= 48 else 64)
+        btg = btg or 64
+        lib = get_lib_variant({"BATCH_BIG_MAXN": big_n, "BATCH_BIG_BTG": btg})
+        lib.batched_jacobi_eigh_vg(Aw, V, int(n), int(max_sweeps), float(tol),
+                                   threads=(btg * B,), group_size=(btg,))
+
     w = torch.diagonal(Aw, dim1=-2, dim2=-1)           # (B, n)
     order = torch.argsort(w, dim=-1)
     w = torch.gather(w, -1, order)
     V = torch.gather(V, 2, order.unsqueeze(1).expand(B, n, n))
     return w.to(out_dev), V.to(out_dev)
+
+
+# ── batched SVD (Phase 3: one-sided Jacobi, the GPU-speedup path for SVD) ──
+SVD_M_MAX = 64         # must match `SVD_MAXM` in metal
+SVD_N_MAX = 32         # must match `SVD_MAXN`
+SVD_BTG = 32           # must match `SVD_BTG`
+
+
+def _run_svd_tall(A: torch.Tensor, max_sweeps: int, tol: float):
+    """One-sided Jacobi SVD for tall batches (m >= n). Returns U,S,V sorted desc."""
+    B, m, n = A.shape
+    assert m >= n and m <= SVD_M_MAX and n <= SVD_N_MAX, \
+        f"tall path needs n<=m, m<={SVD_M_MAX}, n<={SVD_N_MAX} (got {m}x{n})"
+    lib = get_lib()
+    U = A.to(device="mps", dtype=torch.float32).contiguous().clone()  # -> U
+    V = torch.empty(B, n, n, device="mps", dtype=torch.float32)
+    S = torch.empty(B, n, device="mps", dtype=torch.float32)
+    lib.batched_jacobi_svd(U, V, S, int(m), int(n), int(max_sweeps), float(tol),
+                           threads=(SVD_BTG * B,), group_size=(SVD_BTG,))
+    order = torch.argsort(S, dim=-1, descending=True)
+    S = torch.gather(S, 1, order)
+    U = torch.gather(U, 2, order.unsqueeze(1).expand(B, m, n))
+    V = torch.gather(V, 2, order.unsqueeze(1).expand(B, n, n))
+    return U, S, V
+
+
+def batched_svd(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6):
+    """Batched reduced SVD for many small matrices, one GPU threadgroup each.
+
+    A : (B, m, n).  Returns (U (B,m,k), S (B,k), Vh (B,k,n)), k=min(m,n), matching
+    torch.linalg.svd(A, full_matrices=False). Tall handled directly; wide via
+    transpose. Supports max(m,n) <= 64 and min(m,n) <= 32.
+    """
+    assert A.ndim == 3, "(B, m, n) expected"
+    B, m, n = A.shape
+    out_dev = A.device if A.device.type == "mps" else "cpu"
+
+    if m >= n:
+        U, S, V = _run_svd_tall(A, max_sweeps, tol)
+        Vh = V.transpose(-2, -1)
+    else:
+        # A = (Aᵀ)ᵀ; tall-SVD of Aᵀ gives (Ut,S,Vt) -> U_A = Vt, Vh_A = Utᵀ
+        Ut, S, Vt = _run_svd_tall(A.transpose(-2, -1).contiguous(), max_sweeps, tol)
+        U, Vh = Vt, Ut.transpose(-2, -1)
+    return U.to(out_dev), S.to(out_dev), Vh.to(out_dev)
 
 
 def metal_svd(A: torch.Tensor, full_matrices: bool = False):

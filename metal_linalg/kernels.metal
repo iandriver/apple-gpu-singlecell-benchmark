@@ -257,3 +257,199 @@ kernel void batched_jacobi_eigh(
         Vb[idx] = sV[idx];
     }
 }
+
+// ─── Phase 3: BATCHED one-sided (Hestenes) Jacobi SVD ──────────────────────
+//
+// One threadgroup per matrix; columns of A (m x n, tall: m >= n) are orthogonalized
+// in threadgroup memory by right-side Jacobi rotations, while V accumulates the
+// rotations. At convergence: column norms are the singular values, the normalized
+// columns are U, and V holds the right singular vectors. Threadgroup-resident, so
+// the throughput win mirrors batched eigh; one-sided Jacobi is accurate for small
+// singular values (unlike a Gram/AᵀA approach).
+//
+//   A : [B, m, n]  -> overwritten with U (economy, m x n, orthonormal columns)
+//   V : [B, n, n]  -> right singular vectors (V, not Vᵀ)
+//   S : [B, n]     -> singular values (unsorted; the host sorts descending)
+//
+// Convergence is detected with zero communication: every thread computes the same
+// column dot products (from the shared reduction) and the same rotate/skip decision,
+// so a per-thread register flag agrees across the threadgroup.
+#ifndef SVD_MAXM
+#define SVD_MAXM 64
+#endif
+#ifndef SVD_MAXN
+#define SVD_MAXN 32
+#endif
+#ifndef SVD_BTG
+#define SVD_BTG 32
+#endif
+
+kernel void batched_jacobi_svd(
+    device float*  A          [[buffer(0)]],
+    device float*  V          [[buffer(1)]],
+    device float*  S          [[buffer(2)]],
+    constant uint& m          [[buffer(3)]],
+    constant uint& n          [[buffer(4)]],
+    constant uint& max_sweeps [[buffer(5)]],
+    constant float& tol       [[buffer(6)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint b   [[threadgroup_position_in_grid]])
+{
+    threadgroup float sA[SVD_MAXM * SVD_MAXN];
+    threadgroup float sV[SVD_MAXN * SVD_MAXN];
+    threadgroup float ta[SVD_BTG], tb[SVD_BTG], tc[SVD_BTG];
+
+    device float* Ab = A + b * m * n;
+    device float* Vb = V + b * n * n;
+    device float* Sb = S + b * n;
+
+    for (uint idx = tid; idx < m * n; idx += SVD_BTG) sA[idx] = Ab[idx];
+    for (uint idx = tid; idx < n * n; idx += SVD_BTG)
+        sV[idx] = (idx / n == idx % n) ? 1.0f : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint sweep = 0; sweep < max_sweeps; ++sweep) {
+        bool any_rot = false;
+        for (uint i = 0; i + 1 < n; ++i) {
+            for (uint j = i + 1; j < n; ++j) {
+                // column dot products over the m rows (combined 3-way reduction)
+                float la = 0.0f, lb = 0.0f, lg = 0.0f;
+                for (uint k = tid; k < m; k += SVD_BTG) {
+                    const float ai = sA[k * n + i], aj = sA[k * n + j];
+                    la += ai * ai; lb += aj * aj; lg += ai * aj;
+                }
+                ta[tid] = la; tb[tid] = lb; tc[tid] = lg;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint s = SVD_BTG / 2; s > 0; s >>= 1) {
+                    if (tid < s) { ta[tid] += ta[tid + s]; tb[tid] += tb[tid + s]; tc[tid] += tc[tid + s]; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                const float alpha = ta[0], beta = tb[0], gamma = tc[0];
+
+                if (alpha > 0.0f && beta > 0.0f &&
+                    fabs(gamma) > tol * sqrt(alpha * beta)) {
+                    any_rot = true;
+                    const float zeta = (beta - alpha) / (2.0f * gamma);
+                    const float t = (zeta >= 0.0f ? 1.0f : -1.0f) /
+                                    (fabs(zeta) + sqrt(1.0f + zeta * zeta));
+                    const float c = rsqrt(1.0f + t * t), s = t * c;
+                    for (uint k = tid; k < m; k += SVD_BTG) {   // rotate cols i,j of A
+                        const float ai = sA[k * n + i], aj = sA[k * n + j];
+                        sA[k * n + i] = c * ai - s * aj;
+                        sA[k * n + j] = s * ai + c * aj;
+                    }
+                    for (uint k = tid; k < n; k += SVD_BTG) {   // rotate cols i,j of V
+                        const float vi = sV[k * n + i], vj = sV[k * n + j];
+                        sV[k * n + i] = c * vi - s * vj;
+                        sV[k * n + j] = s * vi + c * vj;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+        }
+        if (!any_rot) break;
+    }
+
+    // singular values = column norms of the orthogonalized A
+    for (uint i = tid; i < n; i += SVD_BTG) {
+        float nrm = 0.0f;
+        for (uint k = 0; k < m; ++k) { const float a = sA[k * n + i]; nrm += a * a; }
+        Sb[i] = sqrt(nrm);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // U = normalized columns of A; write U and V back
+    for (uint idx = tid; idx < m * n; idx += SVD_BTG) {
+        const float nrm = Sb[idx % n];
+        Ab[idx] = (nrm > 1e-30f) ? sA[idx] / nrm : 0.0f;
+    }
+    for (uint idx = tid; idx < n * n; idx += SVD_BTG) Vb[idx] = sV[idx];
+}
+
+// ─── Phase 2b: BATCHED eigh for larger n (32 < n <= 64), V in global memory ──
+//
+// For n up to 64, A (n*n floats) still fits in threadgroup memory but A+V (2*n*n)
+// would not, so only A is threadgroup-resident; the eigenvector accumulator V
+// lives in device memory (the V rotation is the only loop that touches global).
+// Widens the batched regime past the n<=32 fully-resident path.
+#ifndef BATCH_BIG_MAXN
+#define BATCH_BIG_MAXN 64
+#endif
+#ifndef BATCH_BIG_BTG
+#define BATCH_BIG_BTG 64
+#endif
+
+kernel void batched_jacobi_eigh_vg(
+    device float*  A          [[buffer(0)]],
+    device float*  V          [[buffer(1)]],
+    constant uint& n          [[buffer(2)]],
+    constant uint& max_sweeps [[buffer(3)]],
+    constant float& tol       [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint b   [[threadgroup_position_in_grid]])
+{
+    threadgroup float sA[BATCH_BIG_MAXN * BATCH_BIG_MAXN];
+    threadgroup float tg[BATCH_BIG_BTG];
+
+    const uint nn = n * n;
+    device float* Ab = A + b * nn;
+    device float* Vb = V + b * nn;
+
+    for (uint idx = tid; idx < nn; idx += BATCH_BIG_BTG) {
+        sA[idx] = Ab[idx];
+        Vb[idx] = (idx / n == idx % n) ? 1.0f : 0.0f;   // V = identity (device)
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    auto off2 = [&]() -> float {
+        float local = 0.0f;
+        for (uint idx = tid; idx < nn; idx += BATCH_BIG_BTG)
+            if (idx / n != idx % n) { float a = sA[idx]; local += a * a; }
+        tg[tid] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = BATCH_BIG_BTG / 2; s > 0; s >>= 1) {
+            if (tid < s) tg[tid] += tg[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return tg[0];
+    };
+    const float thresh = tol * tol * off2();
+
+    for (uint sweep = 0; sweep < max_sweeps; ++sweep) {
+        for (uint p = 0; p + 1 < n; ++p) {
+            for (uint q = p + 1; q < n; ++q) {
+                const float apq = sA[p * n + q];
+                float c = 1.0f, s = 0.0f;
+                if (fabs(apq) > 1e-30f) {
+                    const float app = sA[p * n + p], aqq = sA[q * n + q];
+                    const float tau = (aqq - app) / (2.0f * apq);
+                    const float t = (tau >= 0.0f ? 1.0f : -1.0f) /
+                                    (fabs(tau) + sqrt(1.0f + tau * tau));
+                    c = rsqrt(1.0f + t * t); s = t * c;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (s != 0.0f) {
+                    for (uint k = tid; k < n; k += BATCH_BIG_BTG) {   // cols p,q (sA)
+                        const float akp = sA[k * n + p], akq = sA[k * n + q];
+                        sA[k * n + p] = c * akp - s * akq;
+                        sA[k * n + q] = s * akp + c * akq;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint k = tid; k < n; k += BATCH_BIG_BTG) {   // rows p,q (sA)
+                        const float apk = sA[p * n + k], aqk = sA[q * n + k];
+                        sA[p * n + k] = c * apk - s * aqk;
+                        sA[q * n + k] = s * apk + c * aqk;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint k = tid; k < n; k += BATCH_BIG_BTG) {   // V <- V J (device)
+                        const float vkp = Vb[k * n + p], vkq = Vb[k * n + q];
+                        Vb[k * n + p] = c * vkp - s * vkq;
+                        Vb[k * n + q] = s * vkp + c * vkq;
+                    }
+                    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+                }
+            }
+        }
+        if (off2() <= thresh) break;
+    }
+    for (uint idx = tid; idx < nn; idx += BATCH_BIG_BTG) Ab[idx] = sA[idx];  // diagonal=eigvals
+}
