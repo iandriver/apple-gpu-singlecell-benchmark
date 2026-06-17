@@ -23,7 +23,7 @@ on Metal SVD, [NextLA.jl](https://arxiv.org/html/2508.06339v1), produced singula
 | **2** | **batched eigh — one threadgroup/matrix, threadgroup-resident: actual GPU win** | ✅ **done — up to 7.5×** |
 | **2b** | **batched eigh for larger n (32<n≤64), V in device memory** | ✅ **done — 3.1× @48, 1.3× @64** |
 | **3** | **batched svd — one-sided Jacobi (tall/wide), with vectors** | ✅ **done — up to 6.4×** |
-| 4 | robustness & precision (fp16, scaling, CPU fallback) | planned |
+| **4** | **robustness (auto-dispatch + CPU fallback) & precision (fp16 tested)** | ✅ **done** |
 | 5 | integration: patch `torch.linalg.{svd,eigh}` on MPS, packaging | planned |
 
 ## What Phase 0 delivered
@@ -126,6 +126,28 @@ Speed ([`test_phase3.py`](test_phase3.py)) vs CPU/Accelerate batched `torch.lina
 | 64×32 | 4,096 | 69.5 | 263.8 | **3.8×** |
 | 64×32 | 16,384 | 275.6 | 1055.5 | **3.8×** |
 
+## What Phase 4 delivered — robustness, and an fp16 dead end
+
+**Auto-dispatch** ([`dispatch.py`](dispatch.py)): `eigh(A)` / `svd(A)` route batched
+small matrices to the fast GPU kernels and everything else (single matrices, n>64)
+to CPU LAPACK — so callers get the speedup automatically and a correct answer
+always. A `verify=True` guard recomputes the residual and falls back to CPU for any
+matrix that didn't converge (demonstrated: an under-converged batch at residual
+0.55 is caught and corrected to 1.6e-6).
+
+**fp16 — measured, rejected.** A half-storage variant (`store="fp16"`, compute
+still fp32) was built and benchmarked. It is **not** a speedup on this GPU:
+
+| n | fp32 ms | fp16 ms | fp16/fp32 | fp16 recon |
+|--:|--:|--:|--:|--:|
+| 16 | 22.1 | 31.2 | **0.71×** (slower) | 5e-3 |
+| 32 | 113.1 | 102.4 | 1.10× | 7e-3 |
+
+On M-series the fp16 ALU runs at ~fp32 rate, and the halved threadgroup storage
+didn't buy enough occupancy to win — while accuracy drops to ~fp16. Conclusion:
+**keep fp32.** (The capability stays in the kernel, off by default, as documented
+evidence.)
+
 ## Files
 
 | File | What |
@@ -141,6 +163,8 @@ Speed ([`test_phase3.py`](test_phase3.py)) vs CPU/Accelerate batched `torch.lina
 | [`test_phase2b.py`](test_phase2b.py) | Phase 2b: batched eigh at n=48/64 (V-in-global). |
 | [`test_phase3.py`](test_phase3.py) | Phase 3: batched SVD correctness (tall/wide) + speed. |
 | [`tune_batched.py`](tune_batched.py) | Occupancy autotune sweep for batched eigh. |
+| [`dispatch.py`](dispatch.py) | Phase 4: `eigh`/`svd` auto-dispatch (GPU batched ↔ CPU) + verify-fallback. |
+| [`test_phase4.py`](test_phase4.py) | Phase 4: fp16 measurement, dispatch routing, fallback guard. |
 
 ## Run
 
@@ -151,7 +175,17 @@ python -m metal_linalg.test_phase1    # GPU Jacobi eigh vs LAPACK -> 14 passed
 python -m metal_linalg.test_phase2    # batched eigh: correctness + speed (up to 7.5x)
 python -m metal_linalg.test_phase2b   # batched eigh at n=48/64
 python -m metal_linalg.test_phase3    # batched SVD: correctness + speed (up to 6.4x)
+python -m metal_linalg.test_phase4    # fp16 (rejected) + auto-dispatch + fallback guard
 python -m metal_linalg.tune_batched   # occupancy autotune
+```
+
+Usable API (auto-routes to the fast GPU path, CPU fallback otherwise):
+
+```python
+from metal_linalg import eigh, svd
+w, V   = eigh(A)            # A: (B,n,n), n<=64 -> GPU; else CPU
+U, S, Vh = svd(A)           # A: (B,m,n), small -> GPU; else CPU
+w, V   = eigh(A, verify=True)   # recompute-on-CPU guard for any non-converged matrix
 ```
 
 ## Scope notes

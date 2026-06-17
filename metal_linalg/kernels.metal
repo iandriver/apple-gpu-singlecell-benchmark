@@ -169,6 +169,12 @@ kernel void jacobi_eigh(
 #ifndef BATCH_BTG
 #define BATCH_BTG 64               // threads per matrix (power of two)
 #endif
+// Storage precision for the on-chip matrix. Default float (fp32); define =half for
+// the fp16 variant — halves threadgroup memory (higher occupancy). Compute stays
+// fp32 (locals are float; MSL converts on load/store), so only storage is reduced.
+#ifndef BATCH_STORE
+#define BATCH_STORE float
+#endif
 
 kernel void batched_jacobi_eigh(
     device float*  A          [[buffer(0)]],
@@ -179,8 +185,8 @@ kernel void batched_jacobi_eigh(
     uint tid [[thread_position_in_threadgroup]],
     uint b   [[threadgroup_position_in_grid]])
 {
-    threadgroup float sA[BATCH_MAX_BN * BATCH_MAX_BN];
-    threadgroup float sV[BATCH_MAX_BN * BATCH_MAX_BN];
+    threadgroup BATCH_STORE sA[BATCH_MAX_BN * BATCH_MAX_BN];
+    threadgroup BATCH_STORE sV[BATCH_MAX_BN * BATCH_MAX_BN];
     threadgroup float tg[BATCH_BTG];
 
     const uint nn = n * n;

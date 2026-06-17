@@ -104,33 +104,39 @@ def _default_btg(n: int) -> int:
 
 
 def batched_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
-                 max_bn: int | None = None, btg: int | None = None):
+                 max_bn: int | None = None, btg: int | None = None,
+                 store: str = "fp32"):
     """Batched symmetric eigh for many small matrices, one GPU threadgroup each.
 
     A : (B, n, n), n <= 64.  Returns (w (B,n) ascending, V (B,n,n)).
     n <= 32 uses the fully threadgroup-resident kernel (A and V on-chip); 32 < n <= 64
-    keeps A on-chip and V in device memory. max_bn / btg override the autotuned config.
+    keeps A on-chip and V in device memory. `store="fp16"` halves the on-chip storage
+    (compute stays fp32) for higher occupancy, at reduced accuracy. max_bn / btg
+    override the autotuned config.
     """
     assert A.ndim == 3 and A.shape[1] == A.shape[2], "(B, n, n) expected"
     B, n, _ = A.shape
     assert n <= BATCH_N_MAX, f"batched path supports n <= {BATCH_N_MAX} (got {n})"
+    assert store in ("fp32", "fp16")
     out_dev = A.device if A.device.type == "mps" else "cpu"
 
     Aw = A.to(device="mps", dtype=torch.float32).contiguous().clone()
     V = torch.empty_like(Aw)
 
     if n <= 32:
-        max_bn = max_bn or _bucket(n)
-        btg = btg or _default_btg(n)
-        lib = get_lib_variant({"BATCH_MAX_BN": max_bn, "BATCH_BTG": btg})
+        defines = {"BATCH_MAX_BN": max_bn or _bucket(n), "BATCH_BTG": btg or _default_btg(n)}
+        if store == "fp16":
+            defines["BATCH_STORE"] = "half"
+        g = defines["BATCH_BTG"]
+        lib = get_lib_variant(defines)
         lib.batched_jacobi_eigh(Aw, V, int(n), int(max_sweeps), float(tol),
-                                threads=(btg * B,), group_size=(btg,))
+                                threads=(g * B,), group_size=(g,))
     else:
-        big_n = max_bn or (48 if n <= 48 else 64)
-        btg = btg or 64
-        lib = get_lib_variant({"BATCH_BIG_MAXN": big_n, "BATCH_BIG_BTG": btg})
+        g = btg or 64
+        lib = get_lib_variant({"BATCH_BIG_MAXN": max_bn or (48 if n <= 48 else 64),
+                               "BATCH_BIG_BTG": g})
         lib.batched_jacobi_eigh_vg(Aw, V, int(n), int(max_sweeps), float(tol),
-                                   threads=(btg * B,), group_size=(btg,))
+                                   threads=(g * B,), group_size=(g,))
 
     w = torch.diagonal(Aw, dim1=-2, dim2=-1)           # (B, n)
     order = torch.argsort(w, dim=-1)
