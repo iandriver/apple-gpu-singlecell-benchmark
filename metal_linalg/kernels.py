@@ -49,14 +49,37 @@ def apply_col_rotation(A: torch.Tensor, p: int, q: int, c: float, s: float) -> t
     return A
 
 
-# ── eigh / svd entry points (Phase 0 placeholders) ─────────────────────────
-def metal_eigh(A: torch.Tensor):
-    """Symmetric eigendecomposition. PLACEHOLDER: CPU fallback until Phase 1."""
-    _warn_once("eigh", "metal_eigh is a Phase-0 placeholder (CPU LAPACK). "
-                       "Phase 1 swaps in the Jacobi Metal kernel.")
-    w, V = torch.linalg.eigh(A.detach().to("cpu", torch.float32))
-    dev = A.device if A.device.type == "mps" else "cpu"
-    return w.to(dev), V.to(dev)
+# ── eigh entry point (Phase 1: GPU Jacobi for n <= EIGH_GPU_MAX) ───────────
+# Single-threadgroup Jacobi; correctness-first. Above the cap we fall back to CPU
+# (Phase 2 adds the multi-threadgroup path for large n).
+EIGH_TG = 256          # threads per threadgroup (must match `constant TG` in metal)
+EIGH_GPU_MAX = 256     # Phase 1 scope
+
+
+def metal_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
+               force_gpu: bool = False):
+    """Symmetric eigendecomposition -> (eigenvalues ascending, eigenvectors).
+
+    GPU two-sided Jacobi for n <= EIGH_GPU_MAX; CPU LAPACK fallback above.
+    """
+    assert A.ndim == 2 and A.shape[0] == A.shape[1], "square matrix expected"
+    n = A.shape[0]
+    out_dev = A.device if A.device.type == "mps" else "cpu"
+
+    if n > EIGH_GPU_MAX and not force_gpu:
+        _warn_once("eigh_cpu", f"metal_eigh: n={n} > {EIGH_GPU_MAX}, using CPU "
+                               f"fallback (Phase 2 covers large n).")
+        w, V = torch.linalg.eigh(A.detach().to("cpu", torch.float32))
+        return w.to(out_dev), V.to(out_dev)
+
+    lib = get_lib()
+    Aw = _as_mps_f32(A).clone()                       # destroyed -> diagonal = eigvals
+    V = torch.eye(n, device="mps", dtype=torch.float32)
+    lib.jacobi_eigh(Aw, V, int(n), int(max_sweeps), float(tol),
+                    threads=(EIGH_TG,), group_size=(EIGH_TG,))
+    w = torch.diagonal(Aw).clone()
+    order = torch.argsort(w)                           # ascending, LAPACK convention
+    return w[order].to(out_dev), V[:, order].to(out_dev)
 
 
 def metal_svd(A: torch.Tensor, full_matrices: bool = False):

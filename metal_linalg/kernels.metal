@@ -50,3 +50,100 @@ kernel void apply_col_rotation(
     A[ip] = c * ap - s * aq;
     A[iq] = s * ap + c * aq;
 }
+
+// ─── Phase 1: two-sided cyclic Jacobi symmetric eigendecomposition ──────────
+//
+// One threadgroup of TG threads cooperatively diagonalizes a symmetric n x n
+// matrix A (row-major, in device memory) by a sweep of Jacobi rotations, while
+// accumulating the eigenvectors into V (pre-initialized to the identity).
+//
+//   A  -> destroyed; its diagonal holds the eigenvalues on return
+//   V  -> identity in, eigenvectors (columns) out
+//
+// Correctness-first: A and V live in device memory (no threadgroup-memory size
+// limit, so any n works) and a single threadgroup does the work. This is slow at
+// small n (CPU/AMX wins there) — the point of Phase 1 is to prove the algorithm
+// and the kernel mechanics. Phase 2 adds tiling / multiple threadgroups for speed.
+//
+// TG must be a power of two and equal the dispatch's threads-per-threadgroup.
+constant uint TG = 256;
+
+// Sum of squares of the off-diagonal entries (counts both triangles), tree-reduced.
+inline float off_diag_norm2(device const float* A, uint n, uint tid, uint tcount,
+                            threadgroup float* tg)
+{
+    float local = 0.0f;
+    for (uint idx = tid; idx < n * n; idx += tcount) {
+        if (idx / n != idx % n) { float a = A[idx]; local += a * a; }
+    }
+    tg[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tcount / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) tg[tid] += tg[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return tg[0];
+}
+
+kernel void jacobi_eigh(
+    device float*  A          [[buffer(0)]],
+    device float*  V          [[buffer(1)]],
+    constant uint& n          [[buffer(2)]],
+    constant uint& max_sweeps [[buffer(3)]],
+    constant float& tol       [[buffer(4)]],
+    uint tid    [[thread_position_in_threadgroup]],
+    uint tcount [[threads_per_threadgroup]])
+{
+    threadgroup float tg[TG];
+
+    const float init_off2 = off_diag_norm2(A, n, tid, tcount, tg);
+    const float thresh = tol * tol * init_off2;   // converged when off² ≤ thresh
+
+    for (uint sweep = 0; sweep < max_sweeps; ++sweep) {
+        for (uint p = 0; p + 1 < n; ++p) {
+            for (uint q = p + 1; q < n; ++q) {
+                // every thread computes the same rotation from the same globals
+                const float apq = A[p * n + q];
+                float c = 1.0f, s = 0.0f;
+                if (fabs(apq) > 1e-30f) {
+                    const float app = A[p * n + p];
+                    const float aqq = A[q * n + q];
+                    const float tau = (aqq - app) / (2.0f * apq);
+                    const float t = (tau >= 0.0f ? 1.0f : -1.0f) /
+                                    (fabs(tau) + sqrt(1.0f + tau * tau));
+                    c = rsqrt(1.0f + t * t);
+                    s = t * c;
+                }
+                threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+                if (s != 0.0f) {
+                    // A <- (A J): rotate columns p,q  (A[k,p], A[k,q] for all rows k)
+                    for (uint k = tid; k < n; k += tcount) {
+                        const float akp = A[k * n + p];
+                        const float akq = A[k * n + q];
+                        A[k * n + p] = c * akp - s * akq;
+                        A[k * n + q] = s * akp + c * akq;
+                    }
+                    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+                    // A <- (Jᵀ A): rotate rows p,q using the column-updated matrix
+                    for (uint k = tid; k < n; k += tcount) {
+                        const float apk = A[p * n + k];
+                        const float aqk = A[q * n + k];
+                        A[p * n + k] = c * apk - s * aqk;
+                        A[q * n + k] = s * apk + c * aqk;
+                    }
+                    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+                    // V <- V J: accumulate eigenvectors (column rotation)
+                    for (uint k = tid; k < n; k += tcount) {
+                        const float vkp = V[k * n + p];
+                        const float vkq = V[k * n + q];
+                        V[k * n + p] = c * vkp - s * vkq;
+                        V[k * n + q] = s * vkp + c * vkq;
+                    }
+                    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+                }
+            }
+        }
+        if (off_diag_norm2(A, n, tid, tcount, tg) <= thresh) break;
+    }
+}
