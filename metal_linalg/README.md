@@ -27,14 +27,27 @@ import torch, metal_linalg
 w, V    = metal_linalg.eigh(A)            # A: (B,n,n) on mps, n<=64
 U, S, Vh = metal_linalg.svd(A)            # A: (B,m,n), max<=64 & min<=32
 
-# Option B — transparent drop-in: make stock torch.linalg work on MPS:
+# Option B — transparent drop-in: make the whole torch.linalg factorization
+# surface work on MPS tensors:
 metal_linalg.install()
-w, V = torch.linalg.eigh(A_on_mps)        # was NotImplementedError; now works + fast
+w, V    = torch.linalg.eigh(A_on_mps)     # was NotImplementedError; GPU for batched-small
+Q, R    = torch.linalg.qr(M_on_mps)       # natively HANGS on MPS; now works
+P       = torch.linalg.pinv(M_on_mps)     # svd-based; now works on MPS
 metal_linalg.uninstall()                  # (or: `with metal_linalg.patched(): ...`)
 ```
 
-The patch only intercepts **MPS** tensors (where `torch.linalg` currently raises);
-CPU tensors pass straight through to the original LAPACK path, unchanged.
+**Coverage of the patch** (MPS tensors only; CPU tensors pass straight through to
+the original LAPACK, unchanged):
+
+| ops | on MPS |
+|---|---|
+| `eigh`, `eigvalsh`, `svd`, `svdvals` | **GPU kernels** for batched-small; CPU round-trip otherwise |
+| `qr`, `eig`, `eigvals`, `lstsq`, `pinv`, `matrix_rank`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU kernel — makes the call succeed) |
+
+The round-trip moves inputs to CPU, runs LAPACK, and moves the result **back to the
+input device/dtype**, preserving the structseq return type (`.eigenvalues`, unpacking,
+etc.). We force the CPU path for unsupported ops rather than "try MPS first" because
+some — notably `qr` — *hang* on MPS instead of raising.
 
 ## Status
 
@@ -48,6 +61,7 @@ CPU tensors pass straight through to the original LAPACK path, unchanged.
 | **4** | **robustness (auto-dispatch + CPU fallback) & precision (fp16 tested)** | ✅ **done** |
 | **6** | **parallel-ordering Jacobi rewrite (round-robin)** | ✅ **built, tested — slower for batched; not default** |
 | **5** | **drop-in `torch.linalg.{eigh,svd}` patch + pip packaging** | ✅ **done** |
+| **7** | **complete `torch.linalg`-on-MPS shim (full factorization surface)** | ✅ **done** |
 
 ## What Phase 0 delivered
 
@@ -206,6 +220,17 @@ CPU path unchanged → `uninstall()` restores. Packaged via [`pyproject.toml`](.
 as a pure-Python wheel (`pip install -e .`); the `.metal` source ships as package data
 and compiles at runtime.
 
+## What Phase 7 delivered — the complete torch.linalg-on-MPS shim
+
+`install()` now patches the whole factorization/solver surface (table above), not just
+eigh/svd, so arbitrary PyTorch linalg code runs on MPS tensors — GPU-accelerated where
+we have kernels, transparent device-preserving CPU round-trip everywhere else.
+Verified ([`test_phase7.py`](test_phase7.py), 12/12): eigh/eigvalsh/svd/svdvals on GPU;
+qr/pinv/lstsq/eigvals/slogdet via round-trip; large single matrices; CPU inputs
+untouched; clean uninstall. This is the "make PyTorch linalg work on the Apple GPU"
+layer — honest about what's GPU-accelerated (batched-small) vs merely made-to-work
+(CPU round-trip), with no silent surprises.
+
 ## Files
 
 | File | What |
@@ -224,8 +249,9 @@ and compiles at runtime.
 | [`dispatch.py`](dispatch.py) | Phase 4: `eigh`/`svd` auto-dispatch (GPU batched ↔ CPU) + verify-fallback. |
 | [`test_phase4.py`](test_phase4.py) | Phase 4: fp16 measurement, dispatch routing, fallback guard. |
 | [`test_phase6.py`](test_phase6.py) | Phase 6: parallel-ordering correctness + speed (the negative result). |
-| [`patch.py`](patch.py) | Phase 5: the `torch.linalg.{eigh,svd}` monkey-patch (install/uninstall/patched). |
+| [`patch.py`](patch.py) | The `torch.linalg`-on-MPS shim: full factorization surface (install/uninstall/patched). |
 | [`test_phase5.py`](test_phase5.py) | Phase 5: drop-in patch + packaging test. |
+| [`test_phase7.py`](test_phase7.py) | Phase 7: full torch.linalg-on-MPS surface (12 checks). |
 
 ## Run
 
