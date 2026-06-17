@@ -26,15 +26,18 @@ import contextlib
 
 import torch
 
+from .accel import gpu_matrix_rank, gpu_pinv
 from .dispatch import eigh as _fast_eigh
 from .kernels import (BATCH_N_MAX, SVD_M_MAX, SVD_N_MAX, batched_eigh,
                       batched_svd)
 
 _orig = {}   # name -> original torch.linalg callable
 
-# torch.linalg functions that have no usable MPS path -> always CPU round-trip.
-_FALLBACK_OPS = ["qr", "eig", "eigvals", "lstsq", "pinv", "matrix_rank", "slogdet",
-                 "matrix_power", "cond"]
+# torch.linalg functions with no GPU win here -> CPU round-trip on MPS. We accelerate
+# an op only when its CPU baseline is SVD-bound (pinv, matrix_rank); ops whose CPU path
+# is cheap QR (qr itself, lstsq) are FASTER on CPU, so they round-trip. (Measured in
+# test_phase8: GPU CholeskyQR ~0.08x, GPU-SVD lstsq ~0.73x — both losers.)
+_FALLBACK_OPS = ["qr", "lstsq", "eig", "eigvals", "slogdet", "matrix_power", "cond"]
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -129,6 +132,23 @@ def _svdvals(A, *, driver=None):
     return _orig["svdvals"](A, driver=driver)
 
 
+def _pinv(A, *args, **kwargs):
+    # accelerate only the plain pinv(A) batched-small call; anything fancier -> CPU
+    if _is_mps(A) and not args and not kwargs and _svd_in_range(A, full_matrices=False):
+        return gpu_pinv(A)
+    if _is_mps(A):
+        return _roundtrip(_orig["pinv"], (A, *args), kwargs)
+    return _orig["pinv"](A, *args, **kwargs)
+
+
+def _matrix_rank(A, *args, **kwargs):
+    if _is_mps(A) and not args and not kwargs and _svd_in_range(A, full_matrices=False):
+        return gpu_matrix_rank(A)
+    if _is_mps(A):
+        return _roundtrip(_orig["matrix_rank"], (A, *args), kwargs)
+    return _orig["matrix_rank"](A, *args, **kwargs)
+
+
 def _make_fallback(name):
     def wrapper(*args, **kwargs):
         if args and _is_mps(args[0]):
@@ -139,7 +159,8 @@ def _make_fallback(name):
 
 
 # ── install / uninstall ───────────────────────────────────────────────────--
-_ACCEL = {"eigh": _eigh, "eigvalsh": _eigvalsh, "svd": _svd, "svdvals": _svdvals}
+_ACCEL = {"eigh": _eigh, "eigvalsh": _eigvalsh, "svd": _svd, "svdvals": _svdvals,
+          "pinv": _pinv, "matrix_rank": _matrix_rank}
 
 
 def install():

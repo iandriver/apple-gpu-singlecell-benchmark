@@ -41,8 +41,8 @@ the original LAPACK, unchanged):
 
 | ops | on MPS |
 |---|---|
-| `eigh`, `eigvalsh`, `svd`, `svdvals` | **GPU kernels** for batched-small; CPU round-trip otherwise |
-| `qr`, `eig`, `eigvals`, `lstsq`, `pinv`, `matrix_rank`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU kernel — makes the call succeed) |
+| `eigh`, `eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank` | **GPU-accelerated** for batched-small (via the Metal kernels); CPU round-trip otherwise |
+| `qr`, `lstsq`, `eig`, `eigvals`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU win — makes the call succeed) |
 
 The round-trip moves inputs to CPU, runs LAPACK, and moves the result **back to the
 input device/dtype**, preserving the structseq return type (`.eigenvalues`, unpacking,
@@ -62,6 +62,7 @@ some — notably `qr` — *hang* on MPS instead of raising.
 | **6** | **parallel-ordering Jacobi rewrite (round-robin)** | ✅ **built, tested — slower for batched; not default** |
 | **5** | **drop-in `torch.linalg.{eigh,svd}` patch + pip packaging** | ✅ **done** |
 | **7** | **complete `torch.linalg`-on-MPS shim (full factorization surface)** | ✅ **done** |
+| **8** | **accelerate more ops: pinv (6.2×), matrix_rank (1.7×); qr/lstsq stay CPU** | ✅ **done** |
 
 ## What Phase 0 delivered
 
@@ -231,6 +232,27 @@ untouched; clean uninstall. This is the "make PyTorch linalg work on the Apple G
 layer — honest about what's GPU-accelerated (batched-small) vs merely made-to-work
 (CPU round-trip), with no silent surprises.
 
+## What Phase 8 delivered — accelerating beyond eigh/svd (and a sharp rule)
+
+[`accel.py`](accel.py) adds GPU paths built from `matmul` + our batched SVD, and the
+measurements ([`test_phase8.py`](test_phase8.py)) gave a crisp rule for *when* an op is
+worth accelerating:
+
+| op | path | result |
+|---|---|---|
+| `pinv` | our GPU SVD | **6.2×** ✅ |
+| `matrix_rank` | our GPU svdvals | **1.7×** ✅ |
+| `qr` | GPU CholeskyQR2 | 0.08× ❌ → CPU round-trip |
+| `lstsq` | GPU SVD solve | 0.70× ❌ → CPU round-trip |
+
+**The rule: a GPU op wins only when (a) it routes through our custom Metal kernel and
+(b) the CPU baseline is SVD-bound.** `pinv`/`matrix_rank` win because CPU computes a
+full SVD for them (slow). `qr`/`lstsq` lose because their CPU paths use cheap QR
+(LAPACK gels), *and* the obvious GPU route (CholeskyQR) goes through torch's native MPS
+`cholesky`/`solve_triangular`, which are slow over many tiny matrices — the very gap
+we're working around. So those two stay on the CPU round-trip. (`gpu_qr`/`gpu_lstsq`
+remain in `accel.py` as correct, available implementations.)
+
 ## Files
 
 | File | What |
@@ -250,6 +272,8 @@ layer — honest about what's GPU-accelerated (batched-small) vs merely made-to-
 | [`test_phase4.py`](test_phase4.py) | Phase 4: fp16 measurement, dispatch routing, fallback guard. |
 | [`test_phase6.py`](test_phase6.py) | Phase 6: parallel-ordering correctness + speed (the negative result). |
 | [`patch.py`](patch.py) | The `torch.linalg`-on-MPS shim: full factorization surface (install/uninstall/patched). |
+| [`accel.py`](accel.py) | GPU pinv/matrix_rank (win) + qr/lstsq (correct, kept; CPU is faster). |
+| [`test_phase8.py`](test_phase8.py) | Phase 8: acceleration of pinv/matrix_rank/qr/lstsq + the speed rule. |
 | [`test_phase5.py`](test_phase5.py) | Phase 5: drop-in patch + packaging test. |
 | [`test_phase7.py`](test_phase7.py) | Phase 7: full torch.linalg-on-MPS surface (12 checks). |
 
