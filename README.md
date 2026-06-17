@@ -177,6 +177,15 @@ The day a GPU eigensolver / SVD lands in PyTorch-MPS or MLX, the PCA verdict fli
 and this becomes worth re-running. Track the PyTorch MPS and MLX linalg issue
 trackers. `bench.py` re-measures it in one command.
 
+## Building the missing piece: `metal_linalg/`
+
+Rather than wait for the frameworks, [`metal_linalg/`](metal_linalg/) is a
+follow-up subproject building a general-purpose GPU `eigh`/`svd` for Apple Silicon
+with custom Metal **Jacobi** kernels (dispatched via `torch.mps.compile_shader`).
+**Phase 0 (integration scaffold + accuracy/benchmark harness) is done** — the
+`compile_shader` path is proven and the Jacobi rotation primitive matches NumPy to
+fp32 epsilon. See its [README](metal_linalg/README.md) for the phased roadmap.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
