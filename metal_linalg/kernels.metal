@@ -147,3 +147,108 @@ kernel void jacobi_eigh(
         if (off_diag_norm2(A, n, tid, tcount, tg) <= thresh) break;
     }
 }
+
+// ─── Phase 2: BATCHED Jacobi eigh — the actual GPU-speedup path ─────────────
+//
+// One threadgroup per matrix; the whole grid runs B matrices concurrently across
+// the GPU's cores. Each matrix (n <= MAX_BN) and its eigenvector accumulator live
+// in THREADGROUP MEMORY, so all Jacobi sweeps run with zero global-memory traffic
+// (one load in, one store out). This is where the GPU beats the CPU: many small
+// independent eigendecompositions, fully parallel.
+//
+//   A : [B, n, n] row-major; per-matrix block destroyed, diagonal = eigenvalues
+//   V : [B, n, n]; eigenvectors out (initialized to identity inside the kernel)
+//
+// MAX_BN bounds the threadgroup-memory footprint: sA + sV = 2*MAX_BN^2 floats.
+// At MAX_BN=32 that's 8 KB — small enough for high occupancy (many threadgroups
+// resident per core), which is what makes the batch fast.
+constant uint MAX_BN = 32;
+constant uint BTG = 64;            // threads per matrix (power of two)
+
+kernel void batched_jacobi_eigh(
+    device float*  A          [[buffer(0)]],
+    device float*  V          [[buffer(1)]],
+    constant uint& n          [[buffer(2)]],
+    constant uint& max_sweeps [[buffer(3)]],
+    constant float& tol       [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint b   [[threadgroup_position_in_grid]])
+{
+    threadgroup float sA[MAX_BN * MAX_BN];
+    threadgroup float sV[MAX_BN * MAX_BN];
+    threadgroup float tg[BTG];
+
+    const uint nn = n * n;
+    device float* Ab = A + b * nn;
+    device float* Vb = V + b * nn;
+
+    // load this matrix into threadgroup memory; sV = identity
+    for (uint idx = tid; idx < nn; idx += BTG) {
+        sA[idx] = Ab[idx];
+        sV[idx] = (idx / n == idx % n) ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // initial off-diagonal norm (threadgroup-memory reduction)
+    auto off2 = [&]() -> float {
+        float local = 0.0f;
+        for (uint idx = tid; idx < nn; idx += BTG)
+            if (idx / n != idx % n) { float a = sA[idx]; local += a * a; }
+        tg[tid] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = BTG / 2; s > 0; s >>= 1) {
+            if (tid < s) tg[tid] += tg[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return tg[0];
+    };
+    const float thresh = tol * tol * off2();
+
+    for (uint sweep = 0; sweep < max_sweeps; ++sweep) {
+        for (uint p = 0; p + 1 < n; ++p) {
+            for (uint q = p + 1; q < n; ++q) {
+                const float apq = sA[p * n + q];
+                float c = 1.0f, s = 0.0f;
+                if (fabs(apq) > 1e-30f) {
+                    const float app = sA[p * n + p];
+                    const float aqq = sA[q * n + q];
+                    const float tau = (aqq - app) / (2.0f * apq);
+                    const float t = (tau >= 0.0f ? 1.0f : -1.0f) /
+                                    (fabs(tau) + sqrt(1.0f + tau * tau));
+                    c = rsqrt(1.0f + t * t);
+                    s = t * c;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (s != 0.0f) {
+                    for (uint k = tid; k < n; k += BTG) {   // columns p,q
+                        const float akp = sA[k * n + p];
+                        const float akq = sA[k * n + q];
+                        sA[k * n + p] = c * akp - s * akq;
+                        sA[k * n + q] = s * akp + c * akq;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint k = tid; k < n; k += BTG) {   // rows p,q
+                        const float apk = sA[p * n + k];
+                        const float aqk = sA[q * n + k];
+                        sA[p * n + k] = c * apk - s * aqk;
+                        sA[q * n + k] = s * apk + c * aqk;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (uint k = tid; k < n; k += BTG) {   // V <- V J
+                        const float vkp = sV[k * n + p];
+                        const float vkq = sV[k * n + q];
+                        sV[k * n + p] = c * vkp - s * vkq;
+                        sV[k * n + q] = s * vkp + c * vkq;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+        }
+        if (off2() <= thresh) break;
+    }
+
+    for (uint idx = tid; idx < nn; idx += BTG) {   // store back
+        Ab[idx] = sA[idx];
+        Vb[idx] = sV[idx];
+    }
+}

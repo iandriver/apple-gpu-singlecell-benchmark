@@ -82,6 +82,34 @@ def metal_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
     return w[order].to(out_dev), V[:, order].to(out_dev)
 
 
+# ── batched eigh (Phase 2: the actual GPU-speedup path) ────────────────────
+BATCH_TG = 64          # threads per matrix (must match `constant BTG` in metal)
+BATCH_N_MAX = 32       # must match `constant MAX_BN` in metal
+
+
+def batched_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6):
+    """Batched symmetric eigh for many small matrices, one GPU threadgroup each.
+
+    A : (B, n, n) with n <= BATCH_N_MAX.  Returns (w (B,n) ascending, V (B,n,n)).
+    This is the throughput regime where the GPU beats the CPU.
+    """
+    assert A.ndim == 3 and A.shape[1] == A.shape[2], "(B, n, n) expected"
+    B, n, _ = A.shape
+    assert n <= BATCH_N_MAX, f"batched path supports n <= {BATCH_N_MAX} (got {n})"
+    out_dev = A.device if A.device.type == "mps" else "cpu"
+
+    lib = get_lib()
+    Aw = A.to(device="mps", dtype=torch.float32).contiguous().clone()
+    V = torch.empty_like(Aw)
+    lib.batched_jacobi_eigh(Aw, V, int(n), int(max_sweeps), float(tol),
+                            threads=(BATCH_TG * B,), group_size=(BATCH_TG,))
+    w = torch.diagonal(Aw, dim1=-2, dim2=-1)           # (B, n)
+    order = torch.argsort(w, dim=-1)
+    w = torch.gather(w, -1, order)
+    V = torch.gather(V, 2, order.unsqueeze(1).expand(B, n, n))
+    return w.to(out_dev), V.to(out_dev)
+
+
 def metal_svd(A: torch.Tensor, full_matrices: bool = False):
     """SVD. PLACEHOLDER: CPU fallback until Phase 1."""
     _warn_once("svd", "metal_svd is a Phase-0 placeholder (CPU LAPACK). "

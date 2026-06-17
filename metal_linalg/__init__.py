@@ -6,7 +6,7 @@ metal_eigh / metal_svd are CPU-fallback placeholders until Phase 1.
 """
 
 from ._dispatch import get_lib, mps_available
-from .kernels import apply_col_rotation, metal_eigh, metal_svd, saxpy
+from .kernels import apply_col_rotation, batched_eigh, metal_eigh, metal_svd, saxpy
 
 __all__ = ["mps_available", "get_lib", "saxpy", "apply_col_rotation",
-           "metal_eigh", "metal_svd"]
+           "metal_eigh", "metal_svd", "batched_eigh"]
