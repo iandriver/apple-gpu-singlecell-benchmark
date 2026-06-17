@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metal-linalg"
+version = "0.1.0"
+description = "GPU eigendecomposition / SVD on Apple Silicon (Metal) via PyTorch-MPS custom Jacobi kernels"
+readme = "metal_linalg/README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ian Driver" }]
+keywords = ["apple-silicon", "metal", "mps", "pytorch", "eigh", "svd", "gpu"]
+dependencies = ["torch>=2.10", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/iandriver/apple-gpu-singlecell-benchmark"
+
+# Pure Python: the Metal shader compiles at runtime via torch.mps.compile_shader,
+# so there is no native build step — only the .metal source is bundled as data.
+[tool.setuptools]
+packages = ["metal_linalg"]
+
+[tool.setuptools.package-data]
+metal_linalg = ["*.metal"]

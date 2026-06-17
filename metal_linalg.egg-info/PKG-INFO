@@ -1,3 +1,18 @@
+Metadata-Version: 2.4
+Name: metal-linalg
+Version: 0.1.0
+Summary: GPU eigendecomposition / SVD on Apple Silicon (Metal) via PyTorch-MPS custom Jacobi kernels
+Author: Ian Driver
+License: MIT
+Project-URL: Homepage, https://github.com/iandriver/apple-gpu-singlecell-benchmark
+Keywords: apple-silicon,metal,mps,pytorch,eigh,svd,gpu
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch>=2.10
+Requires-Dist: numpy
+Dynamic: license-file
+
 # metal_linalg — general-purpose GPU `eigh` / `svd` on Apple Metal
 
 PyTorch-MPS and MLX both lack a GPU eigendecomposition / SVD (see the parent
@@ -14,28 +29,6 @@ Householder→bidiagonal→divide-and-conquer pipeline. (Even the SOTA research 
 on Metal SVD, [NextLA.jl](https://arxiv.org/html/2508.06339v1), produced singular
 *values only*, square only — which is exactly what Jacobi avoids.)
 
-## Install & use
-
-```bash
-pip install -e .        # pure Python; the Metal shader compiles at runtime (no Xcode)
-```
-
-```python
-import torch, metal_linalg
-
-# Option A — explicit, auto-routes batched-small to GPU, else CPU:
-w, V    = metal_linalg.eigh(A)            # A: (B,n,n) on mps, n<=64
-U, S, Vh = metal_linalg.svd(A)            # A: (B,m,n), max<=64 & min<=32
-
-# Option B — transparent drop-in: make stock torch.linalg work on MPS:
-metal_linalg.install()
-w, V = torch.linalg.eigh(A_on_mps)        # was NotImplementedError; now works + fast
-metal_linalg.uninstall()                  # (or: `with metal_linalg.patched(): ...`)
-```
-
-The patch only intercepts **MPS** tensors (where `torch.linalg` currently raises);
-CPU tensors pass straight through to the original LAPACK path, unchanged.
-
 ## Status
 
 | Phase | Scope | State |
@@ -47,7 +40,7 @@ CPU tensors pass straight through to the original LAPACK path, unchanged.
 | **3** | **batched svd — one-sided Jacobi (tall/wide), with vectors** | ✅ **done — up to 6.4×** |
 | **4** | **robustness (auto-dispatch + CPU fallback) & precision (fp16 tested)** | ✅ **done** |
 | **6** | **parallel-ordering Jacobi rewrite (round-robin)** | ✅ **built, tested — slower for batched; not default** |
-| **5** | **drop-in `torch.linalg.{eigh,svd}` patch + pip packaging** | ✅ **done** |
+| 5 | integration: patch `torch.linalg.{svd,eigh}` on MPS, packaging | planned |
 
 ## What Phase 0 delivered
 
@@ -194,18 +187,6 @@ the GPU, occupancy/work dominate while per-matrix barrier latency is hidden. Bar
 reduction only helps a *single large* matrix (barrier-bound), which loses to CPU
 anyway. **Kept sequential as the default**; `ordering="par"` stays as opt-in evidence.
 
-## What Phase 5 delivered — drop-in integration + packaging
-
-`install()` monkey-patches `torch.linalg.eigh` / `svd` ([`patch.py`](patch.py)) so
-existing code transparently gets the GPU kernels — **MPS tensors only**, so the CPU
-LAPACK path is untouched. On MPS, batched-small matrices hit the fast Jacobi kernels;
-anything else computes on CPU and returns to the input device (so the call succeeds
-instead of raising `NotImplementedError`). Verified ([`test_phase5.py`](test_phase5.py),
-6/6): stock `eigh(mps)` raises → after `install()` it works and is correct (~1e-6) →
-CPU path unchanged → `uninstall()` restores. Packaged via [`pyproject.toml`](../pyproject.toml)
-as a pure-Python wheel (`pip install -e .`); the `.metal` source ships as package data
-and compiles at runtime.
-
 ## Files
 
 | File | What |
@@ -224,8 +205,6 @@ and compiles at runtime.
 | [`dispatch.py`](dispatch.py) | Phase 4: `eigh`/`svd` auto-dispatch (GPU batched ↔ CPU) + verify-fallback. |
 | [`test_phase4.py`](test_phase4.py) | Phase 4: fp16 measurement, dispatch routing, fallback guard. |
 | [`test_phase6.py`](test_phase6.py) | Phase 6: parallel-ordering correctness + speed (the negative result). |
-| [`patch.py`](patch.py) | Phase 5: the `torch.linalg.{eigh,svd}` monkey-patch (install/uninstall/patched). |
-| [`test_phase5.py`](test_phase5.py) | Phase 5: drop-in patch + packaging test. |
 
 ## Run
 

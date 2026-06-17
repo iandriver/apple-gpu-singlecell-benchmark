@@ -192,8 +192,11 @@ matrices — where the frameworks offer nothing:
 | batched `eigh` | **7.5×** (n=16); >1× through n=64 |
 | batched `svd` | **6.4×** (48×16) |
 
-See its [README](metal_linalg/README.md) for the full size-vs-speedup tables and
-the honest boundaries (the win peaks at small n and fades past n≈64).
+It's **pip-installable** and ships a drop-in `torch.linalg` patch — `metal_linalg.install()`
+makes stock `torch.linalg.eigh`/`svd` work (and accelerate) on MPS tensors, leaving the
+CPU path untouched. See its [README](metal_linalg/README.md) for the full size-vs-speedup
+tables and the honest boundaries (the win peaks at small n and fades past n≈64; fp16 and
+parallel-ordering were tried and measured *slower*, so they're not the default).
 
 ## License
 
