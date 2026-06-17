@@ -103,27 +103,41 @@ def _default_btg(n: int) -> int:
     return {8: 16, 16: 32, 32: 32}[_bucket(n)]
 
 
+def _par_ok(n: int) -> bool:
+    """Parallel-ordering kernel applies for even n within the resident footprint."""
+    return n % 2 == 0 and n <= 48
+
+
 def batched_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
                  max_bn: int | None = None, btg: int | None = None,
-                 store: str = "fp32"):
+                 store: str = "fp32", ordering: str = "auto"):
     """Batched symmetric eigh for many small matrices, one GPU threadgroup each.
 
     A : (B, n, n), n <= 64.  Returns (w (B,n) ascending, V (B,n,n)).
-    n <= 32 uses the fully threadgroup-resident kernel (A and V on-chip); 32 < n <= 64
-    keeps A on-chip and V in device memory. `store="fp16"` halves the on-chip storage
-    (compute stays fp32) for higher occupancy, at reduced accuracy. max_bn / btg
-    override the autotuned config.
+    ordering: "seq" = sequential cyclic kernel (default; fastest for the batched
+    regime), "par" = round-robin parallel-ordering kernel (even n <= 48; correct but
+    MEASURED SLOWER for batched — see test_phase6: its extra temp buffer costs more
+    occupancy than the barrier savings buy). "auto" = seq. `store="fp16"` (seq only)
+    halves on-chip storage; max_bn/btg override.
     """
     assert A.ndim == 3 and A.shape[1] == A.shape[2], "(B, n, n) expected"
     B, n, _ = A.shape
     assert n <= BATCH_N_MAX, f"batched path supports n <= {BATCH_N_MAX} (got {n})"
-    assert store in ("fp32", "fp16")
+    assert store in ("fp32", "fp16") and ordering in ("auto", "par", "seq")
     out_dev = A.device if A.device.type == "mps" else "cpu"
 
     Aw = A.to(device="mps", dtype=torch.float32).contiguous().clone()
     V = torch.empty_like(Aw)
 
-    if n <= 32:
+    use_par = ordering == "par"   # opt-in only; seq wins in the batched regime
+
+    if use_par:
+        assert _par_ok(n), f"parallel ordering needs even n <= 48 (got {n})"
+        g = btg or 64
+        lib = get_lib_variant({"PAR_MAXN": max_bn or (32 if n <= 32 else 48), "PAR_BTG": g})
+        lib.batched_jacobi_eigh_par(Aw, V, int(n), int(max_sweeps), float(tol),
+                                    threads=(g * B,), group_size=(g,))
+    elif n <= 32:
         defines = {"BATCH_MAX_BN": max_bn or _bucket(n), "BATCH_BTG": btg or _default_btg(n)}
         if store == "fp16":
             defines["BATCH_STORE"] = "half"

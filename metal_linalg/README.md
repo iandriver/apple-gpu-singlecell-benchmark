@@ -24,6 +24,7 @@ on Metal SVD, [NextLA.jl](https://arxiv.org/html/2508.06339v1), produced singula
 | **2b** | **batched eigh for larger n (32<n≤64), V in device memory** | ✅ **done — 3.1× @48, 1.3× @64** |
 | **3** | **batched svd — one-sided Jacobi (tall/wide), with vectors** | ✅ **done — up to 6.4×** |
 | **4** | **robustness (auto-dispatch + CPU fallback) & precision (fp16 tested)** | ✅ **done** |
+| **6** | **parallel-ordering Jacobi rewrite (round-robin)** | ✅ **built, tested — slower for batched; not default** |
 | 5 | integration: patch `torch.linalg.{svd,eigh}` on MPS, packaging | planned |
 
 ## What Phase 0 delivered
@@ -148,6 +149,29 @@ didn't buy enough occupancy to win — while accuracy drops to ~fp16. Conclusion
 **keep fp32.** (The capability stays in the kernel, off by default, as documented
 evidence.)
 
+## What Phase 6 found — parallel ordering is slower for batches (negative result)
+
+The sequential kernel processes pairs one at a time (O(n²) barriers/sweep). The
+textbook fix is the **round-robin tournament**: n/2 disjoint rotations per round,
+n−1 rounds/sweep, applied as one transform A ← JᵀAJ — O(n) barriers/sweep.
+`batched_jacobi_eigh_par` implements it (circle-method pairing, double-buffered
+two-sided update). It is **correct** (~1e-6 vs LAPACK) but **slower** in the batched
+regime ([`test_phase6.py`](test_phase6.py), batch=16384):
+
+| n | seq ms | par ms | par/seq |
+|--:|--:|--:|--:|
+| 8 | 11.7 | 12.7 | 0.92× |
+| 16 | 21.4 | 31.0 | 0.69× |
+| 32 | 112.9 | 171.2 | 0.66× |
+| 48 | 402.7 | 745.7 | **0.54×** |
+
+Why: the parallel two-sided update needs a third on-chip buffer (3·n² vs 2·n²) and
+touches the full matrix every round, so it costs **more occupancy and more total
+work** — and in the batched regime, where thousands of matrices already saturate
+the GPU, occupancy/work dominate while per-matrix barrier latency is hidden. Barrier
+reduction only helps a *single large* matrix (barrier-bound), which loses to CPU
+anyway. **Kept sequential as the default**; `ordering="par"` stays as opt-in evidence.
+
 ## Files
 
 | File | What |
@@ -165,6 +189,7 @@ evidence.)
 | [`tune_batched.py`](tune_batched.py) | Occupancy autotune sweep for batched eigh. |
 | [`dispatch.py`](dispatch.py) | Phase 4: `eigh`/`svd` auto-dispatch (GPU batched ↔ CPU) + verify-fallback. |
 | [`test_phase4.py`](test_phase4.py) | Phase 4: fp16 measurement, dispatch routing, fallback guard. |
+| [`test_phase6.py`](test_phase6.py) | Phase 6: parallel-ordering correctness + speed (the negative result). |
 
 ## Run
 

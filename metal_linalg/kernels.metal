@@ -459,3 +459,121 @@ kernel void batched_jacobi_eigh_vg(
     }
     for (uint idx = tid; idx < nn; idx += BATCH_BIG_BTG) Ab[idx] = sA[idx];  // diagonal=eigvals
 }
+
+// ─── Phase 6: PARALLEL-ORDERING batched Jacobi eigh ─────────────────────────
+//
+// The sequential kernel processes n(n-1)/2 pairs one at a time, each gated by
+// barriers. This version uses the round-robin tournament ("circle method"): each
+// of the n-1 rounds pairs all n indices into n/2 DISJOINT pairs, and the whole
+// orthogonal transform J (product of those n/2 plane rotations) is applied at once
+// as A <- Jᵀ A J. Barriers per sweep drop from O(n²) to O(n), and every thread
+// stays busy. Requires n even and n <= PAR_MAXN; buffers sA, sV, sB(temp) = 3·n².
+//
+// Per-index rotation coefficients: col_i' = selfc[i]*col_i + crossb[i]*col_{partner[i]}
+// with selfc=c for both pair members and crossb = -s (low index) / +s (high index);
+// rows and V transform with the same coefficients.
+#ifndef PAR_MAXN
+#define PAR_MAXN 32
+#endif
+#ifndef PAR_BTG
+#define PAR_BTG 64
+#endif
+
+kernel void batched_jacobi_eigh_par(
+    device float*  A          [[buffer(0)]],
+    device float*  V          [[buffer(1)]],
+    constant uint& n          [[buffer(2)]],
+    constant uint& max_sweeps [[buffer(3)]],
+    constant float& tol       [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint b   [[threadgroup_position_in_grid]])
+{
+    threadgroup float sA[PAR_MAXN * PAR_MAXN];
+    threadgroup float sV[PAR_MAXN * PAR_MAXN];
+    threadgroup float sB[PAR_MAXN * PAR_MAXN];     // shared temp (A pass, then V pass)
+    threadgroup float selfc[PAR_MAXN], crossb[PAR_MAXN];
+    threadgroup uint  partner[PAR_MAXN], idx[PAR_MAXN];
+    threadgroup float tg[PAR_BTG];
+
+    const uint nn = n * n;
+    device float* Ab = A + b * nn;
+    device float* Vb = V + b * nn;
+
+    for (uint e = tid; e < nn; e += PAR_BTG) {
+        sA[e] = Ab[e];
+        sV[e] = (e / n == e % n) ? 1.0f : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto off2 = [&]() -> float {
+        float local = 0.0f;
+        for (uint e = tid; e < nn; e += PAR_BTG)
+            if (e / n != e % n) { float a = sA[e]; local += a * a; }
+        tg[tid] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = PAR_BTG / 2; s > 0; s >>= 1) {
+            if (tid < s) tg[tid] += tg[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return tg[0];
+    };
+    const float thresh = tol * tol * off2();
+
+    for (uint sweep = 0; sweep < max_sweeps; ++sweep) {
+        for (uint e = tid; e < n; e += PAR_BTG) idx[e] = e;   // circle-method reset
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint round = 0; round + 1 < n; ++round) {
+            // build this round's n/2 disjoint pairs + rotation coefficients
+            if (tid < n / 2) {
+                const uint a = idx[tid], bb = idx[n - 1 - tid];
+                const uint lo = min(a, bb), hi = max(a, bb);
+                const float apq = sA[lo * n + hi];
+                float c = 1.0f, s = 0.0f;
+                if (fabs(apq) > 1e-30f) {
+                    const float app = sA[lo * n + lo], aqq = sA[hi * n + hi];
+                    const float tau = (aqq - app) / (2.0f * apq);
+                    const float t = (tau >= 0.0f ? 1.0f : -1.0f) /
+                                    (fabs(tau) + sqrt(1.0f + tau * tau));
+                    c = rsqrt(1.0f + t * t); s = t * c;
+                }
+                selfc[a] = c; selfc[bb] = c;
+                partner[a] = bb; partner[bb] = a;
+                crossb[lo] = -s; crossb[hi] = s;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // A J  -> sB   (column transform; reads sA)
+            for (uint e = tid; e < nn; e += PAR_BTG) {
+                const uint k = e / n, i = e % n;
+                sB[e] = selfc[i] * sA[k * n + i] + crossb[i] * sA[k * n + partner[i]];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Jᵀ (A J) -> sA   (row transform; reads sB)
+            for (uint e = tid; e < nn; e += PAR_BTG) {
+                const uint i = e / n, k = e % n;
+                sA[e] = selfc[i] * sB[i * n + k] + crossb[i] * sB[partner[i] * n + k];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // V J -> sB, then copy back to sV
+            for (uint e = tid; e < nn; e += PAR_BTG) {
+                const uint k = e / n, i = e % n;
+                sB[e] = selfc[i] * sV[k * n + i] + crossb[i] * sV[k * n + partner[i]];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = tid; e < nn; e += PAR_BTG) sV[e] = sB[e];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // rotate players over positions 1..n-1 (position 0 fixed)
+            if (tid == 0) {
+                const uint tmp = idx[n - 1];
+                for (uint i = n - 1; i > 1; --i) idx[i] = idx[i - 1];
+                idx[1] = tmp;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (off2() <= thresh) break;
+    }
+
+    for (uint e = tid; e < nn; e += PAR_BTG) { Ab[e] = sA[e]; Vb[e] = sV[e]; }
+}
