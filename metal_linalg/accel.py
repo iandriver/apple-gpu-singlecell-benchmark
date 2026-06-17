@@ -18,6 +18,29 @@ from .kernels import batched_svd
 
 QR_M_MAX = 64      # matches QR_MAXM in kernels.metal
 QR_N_MAX = 32      # matches QR_MAXN
+QR_K_MAX = 8       # matches QR_KMAX (max RHS columns for fused lstsq)
+
+
+def householder_lstsq(A: torch.Tensor, Bmat: torch.Tensor, btg: int = 64):
+    """Least-squares solve min||Ax-b|| via the fused Householder QR-solve kernel.
+
+    A: (B,m,n) tall (m>=n, m<=64, n<=32); Bmat: (B,m) or (B,m,k), k<=8. Returns X
+    (B,n) or (B,n,k) on MPS. The whole solve (Qᵀb + back-substitution) is in-kernel,
+    so it never touches torch's slow MPS solve_triangular.
+    """
+    assert A.ndim == 3 and A.shape[-2] >= A.shape[-1]
+    Bv = Bmat.unsqueeze(-1) if Bmat.ndim == 2 else Bmat
+    Bn, m, n = A.shape
+    k = Bv.shape[-1]
+    assert m <= QR_M_MAX and n <= QR_N_MAX and k <= QR_K_MAX
+    lib = get_lib_variant({"QR_MAXM": QR_M_MAX, "QR_MAXN": QR_N_MAX,
+                           "QR_KMAX": QR_K_MAX, "QR_BTG": btg})
+    Aw = A.to(device="mps", dtype=torch.float32).contiguous()
+    Bw = Bv.to(device="mps", dtype=torch.float32).contiguous()
+    X = torch.empty(Bn, n, k, device="mps", dtype=torch.float32)
+    lib.batched_householder_lstsq(Aw, Bw, X, int(m), int(n), int(k),
+                                  threads=(btg * Bn,), group_size=(btg,))
+    return X.squeeze(-1) if Bmat.ndim == 2 else X
 
 
 def householder_qr(A: torch.Tensor, btg: int = 64):

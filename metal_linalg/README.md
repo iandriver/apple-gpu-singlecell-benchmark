@@ -41,8 +41,8 @@ the original LAPACK, unchanged):
 
 | ops | on MPS |
 |---|---|
-| `eigh`, `eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank`, `qr` | **GPU-accelerated** for batched-small (via the Metal kernels); CPU round-trip otherwise |
-| `lstsq`, `eig`, `eigvals`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU win — makes the call succeed) |
+| `eigh`, `eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank`, `qr`, `lstsq` | **GPU-accelerated** for batched-small (via the Metal kernels); CPU round-trip otherwise |
+| `eig`, `eigvals`, `slogdet`, `cond`, `matrix_power` | transparent **CPU round-trip** (no GPU win — makes the call succeed) |
 
 The round-trip moves inputs to CPU, runs LAPACK, and moves the result **back to the
 input device/dtype**, preserving the structseq return type (`.eigenvalues`, unpacking,
@@ -64,6 +64,7 @@ some — notably `qr` — *hang* on MPS instead of raising.
 | **7** | **complete `torch.linalg`-on-MPS shim (full factorization surface)** | ✅ **done** |
 | **8** | **accelerate more ops: pinv (6.2×), matrix_rank (1.7×)** | ✅ **done** |
 | **9** | **Metal Householder QR kernel — `qr` now GPU (2.4–3.3×)** | ✅ **done — GPU wins** |
+| **10** | **fused QR-solve — `lstsq` now GPU (4.7–6.0×)** | ✅ **done — GPU wins** |
 
 ## What Phase 0 delivered
 
@@ -272,16 +273,29 @@ native MPS `cholesky` — not the math. **Refined rule:** a custom Metal kernel 
 threadgroup, no torch MPS linalg) *can* beat CPU even for cheap factorizations like
 QR; what loses is leaning on torch's native batched MPS linalg over tiny matrices.
 
-`lstsq` was *also* tried via this fast QR but still lost (~0.24×): the QR is fast,
-but the triangular solve `R x = Qᵀb` goes back through torch's slow MPS
-`solve_triangular`. Winning `lstsq` would need the solve fused into the kernel
-(future work); for now it stays a CPU round-trip.
+## What Phase 10 delivered — fused QR-solve makes `lstsq` a GPU win
+
+`lstsq` via QR + `torch.linalg.solve_triangular` lost (~0.24×): the QR was fast, but
+the triangular solve fell back to torch's slow MPS path. `batched_householder_lstsq`
+fuses everything into one kernel — Householder factorization, applying `Qᵀ` to the
+RHS via the reflectors, and the back-substitution `R x = Qᵀb` — so the solve never
+leaves the GPU. Measured ([`test_phase10.py`](test_phase10.py), correctness ~4e-7,
+matrix- and vector-RHS):
+
+| shape | batch | GPU ms | CPU ms | speedup |
+|---|--:|--:|--:|--:|
+| 48×16 | 16,384 | 11.0 | 64.6 | **5.9×** |
+| 64×32 | 16,384 | 26.1 | 156.2 | **6.0×** |
+
+This is the payoff of the "own kernel, no torch MPS linalg" rule taken to its
+conclusion: even the triangular solve — the thing that killed the previous attempt —
+wins once it's in-kernel.
 
 ## Files
 
 | File | What |
 |---|---|
-| [`kernels.metal`](kernels.metal) | Metal source. P1: `jacobi_eigh`. P2: `batched_jacobi_eigh`(+`_vg`). P3: `batched_jacobi_svd`. P9: `batched_householder_qr`. |
+| [`kernels.metal`](kernels.metal) | Metal source. P1: `jacobi_eigh`. P2: `batched_jacobi_eigh`(+`_vg`). P3: `batched_jacobi_svd`. P9: `batched_householder_qr`. P10: `batched_householder_lstsq`. |
 | [`_dispatch.py`](_dispatch.py) | `compile_shader` singleton + MPS-tensor dispatch helpers. |
 | [`kernels.py`](kernels.py) | Python wrappers + `metal_eigh`/`metal_svd` entry points. |
 | [`reference.py`](reference.py) | Accuracy metrics + pathological test matrices. |
@@ -299,6 +313,7 @@ but the triangular solve `R x = Qᵀb` goes back through torch's slow MPS
 | [`accel.py`](accel.py) | GPU pinv/matrix_rank + householder_qr (all wins); gpu_qr/gpu_lstsq kept as reference. |
 | [`test_phase8.py`](test_phase8.py) | Phase 8: acceleration of pinv/matrix_rank + the speed rule. |
 | [`test_phase9.py`](test_phase9.py) | Phase 9: Metal Householder QR — correctness + the GPU-wins benchmark. |
+| [`test_phase10.py`](test_phase10.py) | Phase 10: fused QR-solve lstsq — correctness + GPU-wins benchmark. |
 | [`test_phase5.py`](test_phase5.py) | Phase 5: drop-in patch + packaging test. |
 | [`test_phase7.py`](test_phase7.py) | Phase 7: full torch.linalg-on-MPS surface (12 checks). |
 

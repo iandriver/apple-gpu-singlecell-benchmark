@@ -26,8 +26,8 @@ import contextlib
 
 import torch
 
-from .accel import (QR_M_MAX, QR_N_MAX, gpu_matrix_rank, gpu_pinv,
-                    householder_qr)
+from .accel import (QR_K_MAX, QR_M_MAX, QR_N_MAX, gpu_matrix_rank, gpu_pinv,
+                    householder_lstsq, householder_qr)
 from .dispatch import eigh as _fast_eigh
 from .kernels import (BATCH_N_MAX, SVD_M_MAX, SVD_N_MAX, batched_eigh,
                       batched_svd)
@@ -35,10 +35,7 @@ from .kernels import (BATCH_N_MAX, SVD_M_MAX, SVD_N_MAX, batched_eigh,
 _orig = {}   # name -> original torch.linalg callable
 
 # torch.linalg functions with no GPU win here -> CPU round-trip on MPS.
-# lstsq is here: the GPU QR is fast, but the triangular solve (R x = Qᵀb) goes through
-# torch's native MPS solve_triangular, which is slow over many tiny matrices (~0.24x
-# overall). Winning would require fusing the solve into the QR kernel (future work).
-_FALLBACK_OPS = ["lstsq", "eig", "eigvals", "slogdet", "matrix_power", "cond"]
+_FALLBACK_OPS = ["eig", "eigvals", "slogdet", "matrix_power", "cond"]
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -149,6 +146,21 @@ def _qr(A, mode="reduced"):
     return _orig["qr"](A, mode=mode)
 
 
+def _lstsq(A, B, rcond=None, *, driver=None):
+    if _is_mps(A) and _qr_in_range(A):
+        k = 1 if B.ndim == 2 else B.shape[-1]            # B is (B,m) or (B,m,k)
+        if k <= QR_K_MAX:
+            try:
+                sol = householder_lstsq(A, B)            # fully in-kernel QR-solve
+                empty = torch.empty(0, device=A.device)
+                return _ret("linalg_lstsq", (sol, empty, empty, empty))
+            except Exception:
+                pass
+    if _is_mps(A):
+        return _roundtrip(_orig["lstsq"], (A, B), {"rcond": rcond})
+    return _orig["lstsq"](A, B, rcond=rcond, driver=driver)
+
+
 def _pinv(A, *args, **kwargs):
     # accelerate only the plain pinv(A) batched-small call; anything fancier -> CPU
     if _is_mps(A) and not args and not kwargs and _svd_in_range(A, full_matrices=False):
@@ -177,7 +189,7 @@ def _make_fallback(name):
 
 # ── install / uninstall ───────────────────────────────────────────────────--
 _ACCEL = {"eigh": _eigh, "eigvalsh": _eigvalsh, "svd": _svd, "svdvals": _svdvals,
-          "pinv": _pinv, "matrix_rank": _matrix_rank, "qr": _qr}
+          "pinv": _pinv, "matrix_rank": _matrix_rank, "qr": _qr, "lstsq": _lstsq}
 
 
 def install():

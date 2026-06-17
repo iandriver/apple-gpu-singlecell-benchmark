@@ -677,3 +677,92 @@ kernel void batched_householder_qr(
     device float* Qb = Q + b * m * n;
     for (uint e = tid; e < m * n; e += QR_BTG) Qb[e] = sQ[e];
 }
+
+// ─── Phase 10: fused Householder QR least-squares solve ─────────────────────
+//
+// Solves min ||A x - b|| for tall A (m x n, m>=n) entirely on the GPU, one
+// threadgroup per system. Same Householder factorization as batched_householder_qr,
+// but instead of forming Q we apply Qᵀ to the RHS in place and back-substitute
+// R x = (Qᵀb)[:n] in threadgroup memory — so the triangular solve never leaves the
+// kernel (the part that made the torch.linalg.solve_triangular path slow).
+//
+//   A : [B,m,n]   B : [B,m,k]   ->   X : [B,n,k]
+#ifndef QR_KMAX
+#define QR_KMAX 8
+#endif
+
+kernel void batched_householder_lstsq(
+    device const float* A [[buffer(0)]],
+    device const float* Bmat [[buffer(1)]],
+    device float*       X [[buffer(2)]],
+    constant uint&      m [[buffer(3)]],
+    constant uint&      n [[buffer(4)]],
+    constant uint&      k [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint b   [[threadgroup_position_in_grid]])
+{
+    threadgroup float sA[QR_MAXM * QR_MAXN];
+    threadgroup float sB[QR_MAXM * QR_KMAX];
+    threadgroup float tau[QR_MAXN];
+    threadgroup float tg[QR_BTG];
+
+    device const float* Ab = A + b * m * n;
+    device const float* Bb = Bmat + b * m * k;
+    for (uint e = tid; e < m * n; e += QR_BTG) sA[e] = Ab[e];
+    for (uint e = tid; e < m * k; e += QR_BTG) sB[e] = Bb[e];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Householder factorization (R in upper(sA), v's below, tau[]) ----
+    for (uint j = 0; j < n; ++j) {
+        float local = 0.0f;
+        for (uint i = j + 1 + tid; i < m; i += QR_BTG) { float a = sA[i * n + j]; local += a * a; }
+        tg[tid] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = QR_BTG / 2; s > 0; s >>= 1) {
+            if (tid < s) tg[tid] += tg[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float xnorm2 = tg[0];
+        const float x0 = sA[j * n + j];
+        float beta, tj;
+        if (xnorm2 <= 1e-30f) { beta = x0; tj = 0.0f; }
+        else { const float nrm = sqrt(x0 * x0 + xnorm2);
+               beta = (x0 >= 0.0f) ? -nrm : nrm; tj = (beta - x0) / beta; }
+        if (tj != 0.0f) { const float denom = x0 - beta;
+            for (uint i = j + 1 + tid; i < m; i += QR_BTG) sA[i * n + j] /= denom; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) { tau[j] = tj; sA[j * n + j] = beta; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tj != 0.0f && tid < n && tid > j) {
+            const uint c = tid;
+            float w = sA[j * n + c];
+            for (uint i = j + 1; i < m; ++i) w += sA[i * n + j] * sA[i * n + c];
+            sA[j * n + c] -= tj * w;
+            for (uint i = j + 1; i < m; ++i) sA[i * n + c] -= tj * w * sA[i * n + j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ---- one thread per RHS column: apply Qᵀ to b, then back-substitute ----
+    if (tid < k) {
+        const uint c = tid;
+        for (uint j = 0; j < n; ++j) {                 // Qᵀb = H_{n-1}...H_0 b
+            const float tj = tau[j];
+            if (tj == 0.0f) continue;
+            float w = sB[j * k + c];                   // v[j] = 1
+            for (uint i = j + 1; i < m; ++i) w += sA[i * n + j] * sB[i * k + c];
+            sB[j * k + c] -= tj * w;
+            for (uint i = j + 1; i < m; ++i) sB[i * k + c] -= tj * w * sA[i * n + j];
+        }
+        for (int i = int(n) - 1; i >= 0; --i) {        // back-substitution R x = Qᵀb
+            const uint ui = uint(i);
+            float x = sB[ui * k + c];
+            for (uint l = ui + 1; l < n; ++l) x -= sA[ui * n + l] * sB[l * k + c];
+            sB[ui * k + c] = x / sA[ui * n + ui];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float* Xb = X + b * n * k;
+    for (uint e = tid; e < n * k; e += QR_BTG) Xb[e] = sB[e];   // top n rows = solution
+}

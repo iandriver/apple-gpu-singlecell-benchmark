@@ -198,9 +198,9 @@ CPU path untouched. See its [README](metal_linalg/README.md) for the full size-v
 tables and the honest boundaries (the win peaks at small n and fades past n≈64; fp16 and
 parallel-ordering were tried and measured *slower*, so they're not the default).
 
-Six+ ops are genuinely GPU-accelerated for batched-small matrices — `eigh`,
-`eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank`, and `qr` (a custom Metal
-Householder kernel, 2.4–3.3× over CPU) — with transparent CPU round-trip for the rest.
+Eight ops are genuinely GPU-accelerated for batched-small matrices — `eigh`,
+`eigvalsh`, `svd`, `svdvals`, `pinv`, `matrix_rank`, `qr` (custom Metal Householder,
+2.4–3.3×), and `lstsq` (fused QR-solve, ~6×) — with transparent CPU round-trip for the rest.
 
 **Single-cell use cases** that this unlocks on the Apple GPU live in
 [`examples/`](examples/) — per-cell local intrinsic dimensionality (batched SVD, 5.9×)
