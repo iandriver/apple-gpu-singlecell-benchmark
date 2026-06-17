@@ -159,11 +159,16 @@ kernel void jacobi_eigh(
 //   A : [B, n, n] row-major; per-matrix block destroyed, diagonal = eigenvalues
 //   V : [B, n, n]; eigenvectors out (initialized to identity inside the kernel)
 //
-// MAX_BN bounds the threadgroup-memory footprint: sA + sV = 2*MAX_BN^2 floats.
-// At MAX_BN=32 that's 8 KB — small enough for high occupancy (many threadgroups
-// resident per core), which is what makes the batch fast.
-constant uint MAX_BN = 32;
-constant uint BTG = 64;            // threads per matrix (power of two)
+// BATCH_MAX_BN bounds the threadgroup-memory footprint: sA + sV = 2*MAX_BN^2
+// floats. Smaller footprint + fewer threads/matrix (BATCH_BTG) => more matrices
+// resident per core => higher throughput. Both are #defines so the Python side
+// compiles a specialization tuned to the actual n (occupancy autotuning).
+#ifndef BATCH_MAX_BN
+#define BATCH_MAX_BN 32
+#endif
+#ifndef BATCH_BTG
+#define BATCH_BTG 64               // threads per matrix (power of two)
+#endif
 
 kernel void batched_jacobi_eigh(
     device float*  A          [[buffer(0)]],
@@ -174,16 +179,16 @@ kernel void batched_jacobi_eigh(
     uint tid [[thread_position_in_threadgroup]],
     uint b   [[threadgroup_position_in_grid]])
 {
-    threadgroup float sA[MAX_BN * MAX_BN];
-    threadgroup float sV[MAX_BN * MAX_BN];
-    threadgroup float tg[BTG];
+    threadgroup float sA[BATCH_MAX_BN * BATCH_MAX_BN];
+    threadgroup float sV[BATCH_MAX_BN * BATCH_MAX_BN];
+    threadgroup float tg[BATCH_BTG];
 
     const uint nn = n * n;
     device float* Ab = A + b * nn;
     device float* Vb = V + b * nn;
 
     // load this matrix into threadgroup memory; sV = identity
-    for (uint idx = tid; idx < nn; idx += BTG) {
+    for (uint idx = tid; idx < nn; idx += BATCH_BTG) {
         sA[idx] = Ab[idx];
         sV[idx] = (idx / n == idx % n) ? 1.0f : 0.0f;
     }
@@ -192,11 +197,11 @@ kernel void batched_jacobi_eigh(
     // initial off-diagonal norm (threadgroup-memory reduction)
     auto off2 = [&]() -> float {
         float local = 0.0f;
-        for (uint idx = tid; idx < nn; idx += BTG)
+        for (uint idx = tid; idx < nn; idx += BATCH_BTG)
             if (idx / n != idx % n) { float a = sA[idx]; local += a * a; }
         tg[tid] = local;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = BTG / 2; s > 0; s >>= 1) {
+        for (uint s = BATCH_BTG / 2; s > 0; s >>= 1) {
             if (tid < s) tg[tid] += tg[tid + s];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -220,21 +225,21 @@ kernel void batched_jacobi_eigh(
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (s != 0.0f) {
-                    for (uint k = tid; k < n; k += BTG) {   // columns p,q
+                    for (uint k = tid; k < n; k += BATCH_BTG) {   // columns p,q
                         const float akp = sA[k * n + p];
                         const float akq = sA[k * n + q];
                         sA[k * n + p] = c * akp - s * akq;
                         sA[k * n + q] = s * akp + c * akq;
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                    for (uint k = tid; k < n; k += BTG) {   // rows p,q
+                    for (uint k = tid; k < n; k += BATCH_BTG) {   // rows p,q
                         const float apk = sA[p * n + k];
                         const float aqk = sA[q * n + k];
                         sA[p * n + k] = c * apk - s * aqk;
                         sA[q * n + k] = s * apk + c * aqk;
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                    for (uint k = tid; k < n; k += BTG) {   // V <- V J
+                    for (uint k = tid; k < n; k += BATCH_BTG) {   // V <- V J
                         const float vkp = sV[k * n + p];
                         const float vkq = sV[k * n + q];
                         sV[k * n + p] = c * vkp - s * vkq;
@@ -247,7 +252,7 @@ kernel void batched_jacobi_eigh(
         if (off2() <= thresh) break;
     }
 
-    for (uint idx = tid; idx < nn; idx += BTG) {   // store back
+    for (uint idx = tid; idx < nn; idx += BATCH_BTG) {   // store back
         Ab[idx] = sA[idx];
         Vb[idx] = sV[idx];
     }

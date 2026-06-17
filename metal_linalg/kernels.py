@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from ._dispatch import _as_mps_f32, get_lib, grid_1d
+from ._dispatch import _as_mps_f32, get_lib, get_lib_variant, grid_1d
 
 _warned = set()
 
@@ -83,26 +83,45 @@ def metal_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
 
 
 # ── batched eigh (Phase 2: the actual GPU-speedup path) ────────────────────
-BATCH_TG = 64          # threads per matrix (must match `constant BTG` in metal)
-BATCH_N_MAX = 32       # must match `constant MAX_BN` in metal
+BATCH_N_MAX = 32       # largest n the threadgroup-resident path supports
 
 
-def batched_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6):
+def _bucket(n: int) -> int:
+    """Smallest supported threadgroup footprint (BATCH_MAX_BN) that holds n."""
+    for b in (8, 16, 32):
+        if n <= b:
+            return b
+    raise AssertionError(f"batched path supports n <= {BATCH_N_MAX} (got {n})")
+
+
+def _default_btg(n: int) -> int:
+    """Threads per matrix, autotuned for occupancy (see tune_batched.py).
+
+    Fewer threads/matrix -> more matrices resident per core -> higher throughput,
+    until there are too few threads to cover the work. Measured optima on M5 Pro.
+    """
+    return {8: 16, 16: 32, 32: 32}[_bucket(n)]
+
+
+def batched_eigh(A: torch.Tensor, max_sweeps: int = 30, tol: float = 1e-6,
+                 max_bn: int | None = None, btg: int | None = None):
     """Batched symmetric eigh for many small matrices, one GPU threadgroup each.
 
     A : (B, n, n) with n <= BATCH_N_MAX.  Returns (w (B,n) ascending, V (B,n,n)).
+    max_bn / btg override the autotuned threadgroup footprint / threads-per-matrix.
     This is the throughput regime where the GPU beats the CPU.
     """
     assert A.ndim == 3 and A.shape[1] == A.shape[2], "(B, n, n) expected"
     B, n, _ = A.shape
-    assert n <= BATCH_N_MAX, f"batched path supports n <= {BATCH_N_MAX} (got {n})"
+    max_bn = max_bn or _bucket(n)
+    btg = btg or _default_btg(n)
     out_dev = A.device if A.device.type == "mps" else "cpu"
 
-    lib = get_lib()
+    lib = get_lib_variant({"BATCH_MAX_BN": max_bn, "BATCH_BTG": btg})
     Aw = A.to(device="mps", dtype=torch.float32).contiguous().clone()
     V = torch.empty_like(Aw)
     lib.batched_jacobi_eigh(Aw, V, int(n), int(max_sweeps), float(tol),
-                            threads=(BATCH_TG * B,), group_size=(BATCH_TG,))
+                            threads=(btg * B,), group_size=(btg,))
     w = torch.diagonal(Aw, dim1=-2, dim2=-1)           # (B, n)
     order = torch.argsort(w, dim=-1)
     w = torch.gather(w, -1, order)

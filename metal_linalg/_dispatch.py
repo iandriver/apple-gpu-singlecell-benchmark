@@ -30,17 +30,38 @@ def _load_source() -> str:
     return _SOURCE
 
 
+def _require_mps():
+    if not mps_available():
+        raise RuntimeError(
+            "Requires Apple Silicon + macOS with PyTorch MPS and "
+            "torch.mps.compile_shader (PyTorch >= 2.10)."
+        )
+
+
 def get_lib():
-    """Compiled Metal library (singleton). Raises if MPS/compile_shader missing."""
+    """Compiled Metal library with default #defines (singleton)."""
     global _LIB
     if _LIB is None:
-        if not mps_available():
-            raise RuntimeError(
-                "Requires Apple Silicon + macOS with PyTorch MPS and "
-                "torch.mps.compile_shader (PyTorch >= 2.10)."
-            )
+        _require_mps()
         _LIB = torch.mps.compile_shader(_load_source())
     return _LIB
+
+
+_VARIANTS = {}
+
+
+def get_lib_variant(defines: dict):
+    """Compiled library with `#define` overrides prepended (cached per config).
+
+    Used to specialize the batched kernel's threadgroup footprint (BATCH_MAX_BN)
+    and threads-per-matrix (BATCH_BTG) for occupancy tuning.
+    """
+    key = tuple(sorted(defines.items()))
+    if key not in _VARIANTS:
+        _require_mps()
+        header = "".join(f"#define {k} {v}\n" for k, v in defines.items())
+        _VARIANTS[key] = torch.mps.compile_shader(header + _load_source())
+    return _VARIANTS[key]
 
 
 def _as_mps_f32(t: torch.Tensor) -> torch.Tensor:

@@ -73,18 +73,24 @@ one store out — all Jacobi sweeps run on-chip). This is the throughput regime 
 GPU owns: many small independent eigendecompositions.
 
 Measured ([`test_phase2.py`](test_phase2.py)), GPU `batched_eigh` vs CPU/Accelerate
-batched `torch.linalg.eigh`, correctness ~1e-6 per matrix:
+batched `torch.linalg.eigh`, correctness ~1e-6 per matrix (with the occupancy
+tuning below):
 
 | n | batch | GPU ms | CPU ms | speedup |
 |--:|--:|--:|--:|--:|
-| 16 | 4,096 | 8.4 | 37.1 | **4.4×** |
-| 16 | 16,384 | 33.2 | 149.8 | **4.5×** |
-| 32 | 1,024 | 9.6 | 32.9 | **3.4×** |
-| 32 | 4,096 | 35.8 | 132.3 | **3.7×** |
-| 32 | 16,384 | 140.3 | 548.1 | **3.9×** |
+| 16 | 4,096 | 6.8 | 42.2 | **6.2×** |
+| 16 | 16,384 | 21.4 | 159.9 | **7.5×** |
+| 32 | 1,024 | 8.1 | 37.6 | **4.7×** |
+| 32 | 16,384 | 113.0 | 551.1 | **4.9×** |
 
-GPU wins at every tested point (down to batch=256), sustaining **~4×** once the
-batch saturates the GPU.
+GPU wins at every tested point (down to batch=256).
+
+**Occupancy tuning** ([`tune_batched.py`](tune_batched.py)): the kernel is
+parameterized in threadgroup-memory footprint (`BATCH_MAX_BN`, sized to n) and
+threads-per-matrix (`BATCH_BTG`); compiling a specialization per size lets more
+matrices stay resident per core. Tuning lifted n=16 from 6.2× to **7.5×** and
+n=32 from ~3.9× to ~4.9×. The measured optima (e.g. fewer threads/matrix:
+btg=32) are the baked-in defaults.
 
 Caveats (honest): (1) ~4× is the *steady-state throughput ratio* — both sides scale
 linearly with batch once saturated, so it's not unbounded; (2) timings are
